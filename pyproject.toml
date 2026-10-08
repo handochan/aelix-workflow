@@ -13,6 +13,9 @@ license-files = ["LICENSE"]
 authors = [{ name = "handochan" }]
 dependencies = ["aelix-coding-agent>=0.1.0b2,<0.2", "wcwidth>=0.2"]
 
+[project.urls]
+Repository = "https://github.com/handochan/aelix-workflow"
+
 [project.optional-dependencies]
 tui = ["aelix-coding-agent[tui]>=0.1.0b2,<0.2"]
 

@@ -4,7 +4,6 @@ name = "Aelix Workflow"
 version = "0.1.0"
 description = "Adaptive orchestration with live workflow progress and session evidence"
 authors = ["handochan"]
-# Intended repository metadata; this implementation has not created a remote.
 repository = "https://github.com/handochan/aelix-workflow"
 license = "Apache-2.0"
 

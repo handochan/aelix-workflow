@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: extensions/aelix-workflow
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: extensions/aelix-workflow
+
+      # Match the ../../aelix-ai development sources in pyproject.toml. Pin the
+      # public host so a host-main update cannot silently change this matrix.
+      - name: Check out Aelix host
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: handochan/aelix-ai
+          ref: 28dbcaf4a1a9a97e46d88cec4b90c1ddeb486321
+          path: aelix-ai
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.23"
+          python-version: ${{ matrix.python }}
+          working-directory: extensions/aelix-workflow
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies with TUI support
+        run: uv sync --locked --extra tui
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Check formatting
+        run: uv run --no-sync ruff format --check .
+
+      - name: Check types
+        run: uv run --no-sync pyright
+
+      - name: Test graph, host integration, persistence, TUI rendering and packaging
+        run: uv run --no-sync pytest -q --junitxml=artifacts/junit.xml
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Install wheel and verify extension binding
+        run: uv run --no-sync python scripts/verify_wheel.py
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tests-${{ matrix.os }}-python-${{ matrix.python }}
+          path: extensions/aelix-workflow/artifacts/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14

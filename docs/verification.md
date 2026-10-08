@@ -2,8 +2,8 @@
 
 Date: 2026-10-08
 
-Host: Aelix `0.1.0b2`, sibling source checkout initially inspected at
-`402a801325dcc335e2b7e1a7e829e9b5ebed93ca`; final verification at
+Initial interactive verification host: Aelix `0.1.0b2`, sibling source checkout initially inspected at
+`402a801325dcc335e2b7e1a7e829e9b5ebed93ca`; interactive verification at
 `61f03b6718211c5e3ec81617374ff736881dd999`. The runtime source files used by this extension
 were unchanged between these revisions. The host's existing untracked work was preserved.
 
@@ -40,6 +40,25 @@ per-run settlement/retry boundaries, and actual JSONL file/branch restoration of
 environment with `uv pip install --python .venv/bin/python --no-deps --reinstall dist/aelix_workflow-0.1.0-py3-none-any.whl`.
 `.venv/bin/aelix extension verify aelix-workflow`: **all 1 endpoint(s) BOUND**.
 The global Aelix installation was not changed.
+
+## Python version and OS matrix
+
+The extension is now published to the **private** repository
+[`handochan/aelix-workflow`](https://github.com/handochan/aelix-workflow).
+
+Local macOS arm64 checks against host revision
+`28dbcaf4a1a9a97e46d88cec4b90c1ddeb486321` passed **70 tests each** on CPython
+3.11.15, 3.12.13 and 3.13.13, using separate environments and `uv run --locked --extra tui`.
+
+The [CI workflow](../.github/workflows/ci.yml) defines all nine combinations of Python
+3.11/3.12/3.13 and `ubuntu-latest`/`macos-latest`/`windows-latest`. Every job runs the
+automated checks, builds the wheel and source distribution, installs the wheel, confirms an
+import from the installed environment, and invokes the host's extension-binding verifier.
+The host is pinned to the revision above and dependencies use `uv sync --locked --extra tui`.
+GitHub job results are the evidence for OS coverage; merely defining the matrix is not a pass.
+
+These are model-free checks. Interactive/live-provider evidence below was obtained on macOS;
+it does not establish live model or actual terminal coverage on Windows/Linux.
 
 ## Real terminal verification
 
@@ -170,14 +189,15 @@ in the user's prompt or CLI exit code 0 as success.
 
 ## Bounded findings and remaining scope
 
-- The default `z-ai/glm-5.3-flash` delegated child returned a provider 400 saying reasoning was
-  mandatory and could not be disabled. The current host does not carry the parent's thinking
-  setting through this public spawn path. This provider/profile combination is **not validated**.
+- The initial `z-ai/glm-5.3-flash` delegated child returned a provider 400 saying reasoning was
+  mandatory and could not be disabled. The host at that check did not carry the parent's thinking
+  setting through this public spawn path. The newer CI host includes the thinking-inheritance
+  fix, but this provider/profile combination has **not been retested**.
 - The model catalog listed `gpt-5.4` and `gpt-5.4-mini`, but this account's Codex OAuth endpoint
   rejected both as unsupported. Neither is claimed as a passing live provider check.
 - A file-path profile was correctly refused: delegation resolves registered profile names only.
-- No GitHub CI, remote repository publication, release upload, real model parallel benchmark,
-  write-conflict isolation, background execution, generated scripts, peer mailboxes, or automatic
+- No release upload, real model parallel benchmark, write-conflict isolation, background
+  execution, generated scripts, peer mailboxes, or automatic
   recovery of external side effects was verified or implemented.
 
 The live model and transport-simulation checks establish distinct, bounded evidence. They do

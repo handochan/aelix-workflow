@@ -14,6 +14,15 @@ new investigations, revise invalid assumptions, retry an interrupted task, and a
 This checkout uses the sibling `../../aelix-ai` source for development. Build a wheel for use
 in another environment; the published dependency metadata contains no local paths.
 
+Use this layout when cloning into a new workspace (the extension repository is private):
+
+```text
+workspace/
+  aelix-ai/
+  extensions/
+    aelix-workflow/
+```
+
 ```sh
 uv sync --extra tui
 uv run aelix --agents --trust-extension-path aelix-workflow
@@ -142,9 +151,18 @@ An agent's successful return is execution evidence; it does not prove all accept
 ```sh
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run pyright
 uv build
 ```
+
+[GitHub Actions](https://github.com/handochan/aelix-workflow/actions/workflows/ci.yml) runs the
+same checks across **Python 3.11, 3.12 and 3.13 on Linux, macOS and Windows** (nine jobs).
+Every job runs the tests with TUI dependencies, lint, formatting and type checks, builds both
+distributions, then replaces the editable extension with its wheel and verifies the installed
+entry point through `aelix extension verify`. JUnit results are retained as run artifacts.
+CI pins the Aelix host revision; it does not test every host version in the dependency range.
+Provider calls and interactive terminal sessions are separate, explicitly run checks.
 
 For the real-TUI transport simulation, start Aelix with `-e examples/tui_demo.py` and invoke
 `/workflow-demo`. This makes no model calls. For a small live check using a registered profile:
