@@ -49,6 +49,8 @@ The extension is now published to the **private** repository
 Local macOS arm64 checks against host revision
 `28dbcaf4a1a9a97e46d88cec4b90c1ddeb486321` passed **70 tests each** on CPython
 3.11.15, 3.12.13 and 3.13.13, using separate environments and `uv run --locked --extra tui`.
+The built wheel also installed, imported from site-packages and bound its one extension
+endpoint successfully in all three local environments.
 
 The [CI workflow](../.github/workflows/ci.yml) defines all nine combinations of Python
 3.11/3.12/3.13 and `ubuntu-latest`/`macos-latest`/`windows-latest`. Every job runs the
@@ -56,6 +58,23 @@ automated checks, builds the wheel and source distribution, installs the wheel, 
 import from the installed environment, and invokes the host's extension-binding verifier.
 The host is pinned to the revision above and dependencies use `uv sync --locked --extra tui`.
 GitHub job results are the evidence for OS coverage; merely defining the matrix is not a pass.
+
+GitHub Actions run [37714200372](https://github.com/handochan/aelix-workflow/actions/runs/37714200372)
+at extension commit `84d98fe702914e39ab08b5fea662b2bf258c2e94` completed with **all nine jobs
+successful**. Downloaded and inspected every job's JUnit report: each contains 70 tests with
+zero failures, errors or skips.
+
+| Python | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| 3.11 | 70 passed | 70 passed | 70 passed |
+| 3.12 | 70 passed | 70 passed | 70 passed |
+| 3.13 | 70 passed | 70 passed | 70 passed |
+
+Lint, formatting, Pyright, wheel/source-distribution builds, isolated installed-wheel imports
+and `aelix extension verify aelix-workflow` also passed in every job. Local copies of the
+reports and run metadata are retained under ignored `artifacts/ci-37714200372*`; the run link
+above is the shared verification record. Documentation-only pushes do not rerun this matrix;
+source, tests, scripts, dependencies and workflow changes do.
 
 These are model-free checks. Interactive/live-provider evidence below was obtained on macOS;
 it does not establish live model or actual terminal coverage on Windows/Linux.
