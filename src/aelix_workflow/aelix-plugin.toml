@@ -1,0 +1,40 @@
+[plugin]
+id = "aelix-workflow"
+name = "Aelix Workflow"
+version = "0.1.0"
+description = "Adaptive orchestration with live workflow progress and session evidence"
+authors = ["handochan"]
+# Intended repository metadata; this implementation has not created a remote.
+repository = "https://github.com/handochan/aelix-workflow"
+license = "Apache-2.0"
+
+[plugin.api]
+level = 1
+min_level = 1
+
+[plugin.entry]
+python = "aelix_workflow:setup"
+
+[activation]
+on_startup_finished = true
+
+[capabilities]
+shell_exec = true
+net = true
+ui_tui_trusted = true
+
+[[contributes.tools]]
+name = "workflow_plan"
+description = "Create and revise an adaptive task graph"
+
+[[contributes.tools]]
+name = "workflow_run"
+description = "Execute ready tasks with bounded concurrency"
+
+[[contributes.tools]]
+name = "workflow_status"
+description = "Inspect task states, outputs, attempts and replanning"
+
+[[contributes.commands]]
+id = "workflow"
+description = "Start a workflow, inspect its state, or show/hide its TUI panel"

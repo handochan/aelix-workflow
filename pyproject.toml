@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aelix-workflow"
+version = "0.1.0"
+description = "Adaptive task orchestration with live workflow progress for Aelix"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "handochan" }]
+dependencies = ["aelix-coding-agent>=0.1.0b2,<0.2", "wcwidth>=0.2"]
+
+[project.optional-dependencies]
+tui = ["aelix-coding-agent[tui]>=0.1.0b2,<0.2"]
+
+[project.entry-points."aelix.extensions"]
+aelix-workflow = "aelix_workflow:setup"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aelix_workflow"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "examples", "docs", "README.md", "LICENSE", "pyproject.toml"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.12", "pyright>=1.1.400"]
+
+# Development against the sibling host; wheel metadata contains no local paths.
+[tool.uv.sources]
+aelix-coding-agent = { path = "../../aelix-ai/packages/aelix-coding-agent", editable = true }
+aelix-agent-core = { path = "../../aelix-ai/packages/aelix-agent-core", editable = true }
+aelix-ai = { path = "../../aelix-ai/packages/aelix-ai", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "standard"
