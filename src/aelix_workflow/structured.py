@@ -368,6 +368,27 @@ def render(text: str, item: Any, index: int) -> str:
     return _PLACEHOLDER.sub(substitute, text)
 
 
+_LABEL_KEYS = ("path", "file", "name", "id", "title")
+
+
+def label(item: Any, limit: int = 60) -> str:
+    """A short name for an item, so items of a title without placeholders stay distinct."""
+    value: Any = item
+    if isinstance(item, dict):
+        named = [item.get(key) for key in _LABEL_KEYS]
+        scalars = [v for v in [*named, *item.values()] if isinstance(v, str | int | float)]
+        value = next((v for v in scalars if not isinstance(v, bool) and str(v).strip()), "")
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        return ""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def mask(text: str) -> str:
+    """A template as a label: placeholders become an ellipsis instead of showing raw braces."""
+    return _PLACEHOLDER.sub("…", text)
+
+
 # --- Result extraction -----------------------------------------------------------------
 
 

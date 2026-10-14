@@ -210,8 +210,8 @@ in the user's prompt or CLI exit code 0 as success.
 
 - The initial `z-ai/glm-5.3-flash` delegated child returned a provider 400 saying reasoning was
   mandatory and could not be disabled. The host at that check did not carry the parent's thinking
-  setting through this public spawn path. The newer CI host includes the thinking-inheritance
-  fix, but this provider/profile combination has **not been retested**.
+  setting through this public spawn path. Retested on 2026-10-14 against host `64b82af7`:
+  `glm-5.3-flash` children with high thinking ran normally (see the live model check below).
 - The model catalog listed `gpt-5.4` and `gpt-5.4-mini`, but this account's Codex OAuth endpoint
   rejected both as unsupported. Neither is claimed as a passing live provider check.
 - A file-path profile was correctly refused: delegation resolves registered profile names only.
@@ -246,12 +246,13 @@ used the real host runtime through the test bench, with only the child transport
 
 ### Automated checks
 
-`uv run --no-sync pytest -q`: **239 passed** (70 before this change; three of those were
-updated for the deliberate changes above: Ctrl+C pauses, and unknown or project-scoped profiles
+`uv run --no-sync pytest -q`: **250 passed**: 239 at `a0ded91`, plus eleven regression tests
+for the live check's findings and their review below. There were 70 before this change; three of those were
+updated for the deliberate changes above (Ctrl+C pauses, and unknown or project-scoped profiles
 are now refused while the plan is written). Ruff lint/format and Pyright: clean.
 
-The suite also passed (**238**, all but the packaging test) on **CPython 3.11.15 against the
-CI-pinned host `28dbcaf4`**, installed from a `git archive` of that revision into a scratch
+At `a0ded91` the suite also passed (**238**, all but the packaging test) on **CPython 3.11.15
+against the CI-pinned host `28dbcaf4`**, installed from a `git archive` of that revision into a scratch
 environment. The packaging test builds with the project's own uv environment and ran in the
 main environment. `uv build` then `scripts/verify_wheel.py`: the wheel contains every new
 module, imports from site-packages, and `aelix extension verify` reports the endpoint BOUND.
@@ -313,12 +314,79 @@ Workflow d2bfa3c0a0ce | completed | 4/4 succeeded
 + tests #2 | succeeded | repair 1/2 | [Check] Run the auth tests
 ```
 
+These captures predate the live model check below. A fan-out's own row now masks its
+placeholders, so the first line reads `[Verify] Verify …`.
+
 The first capture also exposed two display defects, both fixed before the captures above: a
 group showed `pending` for up to one progress interval after its items started, and a repaired
 check rendered `succeeded: succeeded`.
 
+### GitHub Actions
+
+Commit `a0ded91` on `feat/dynamic-steps-and-recovery` (run `38491347031`, started by
+`workflow_dispatch`): **9/9 jobs passed**, Ubuntu, macOS and Windows on Python 3.11, 3.12 and
+3.13, against the pinned host `28dbcaf4`.
+
+### Live model check
+
+The real TUI in tmux (130 × 48) ran
+`aelix --agents --trust-extension-path aelix-workflow --approve --permission-mode auto-accept-edits`
+in a scratch git repository: a `calc` package with three bugs and `unittest` tests. Both parent
+and children used the configured default, `z-ai/glm-5.3-flash` on OpenRouter with high
+thinking, on host `64b82af7`. Goals were given in Korean through `/workflow`. Every spawn
+consent and check approval was answered in the TUI.
+
+| Run | Exercised | Result |
+| --- | --- | --- |
+| 1 | The parent wrote a plan from a prose description: a survey with `output_schema`, then a `for_each` review (3 items, 2 in parallel), then one `fix` (`access: write`, `writes: calc/**`), then a `kind: check` (`python3 -m unittest -q`) with `repair` | The plan was valid on its first call. 6 attempts, 4/4 succeeded; all three bugs were fixed, only `calc/` changed, and the tests pass. Workflow spend was $0.0094. Prompt markers, expansion numbers and attempt records appeared as designed. The `workflow_run` report was 7,811 characters. |
+| 2 | A check that fails first, then a repair round | `release-check` failed (`codename must be 'aurora'`). The failure output reached `bump #2` in its prompt, and the check then passed. 4 attempts, $0.0045. The parent itself pointed out that the repair changed a field the original prompt had said to keep. |
+| 3 | A timeout, a parent replan, and a crash | `proofread` hit the old 120 s default. The parent revised it to 600 s and retried. During that retry the Aelix process was killed with `kill -9`. After `aelix --continue`, the attempt was `interrupted` with "Outcome unknown … it ran read, bash", and the child's tool trail was read from its own session file. Then `/workflow continue` led the parent to review, revise and finish, with a third attempt. |
+| 4 | Re-check after the fixes below, in a new session | `for_each` over a structured inventory, 3/3 items. No timeout was set, so the host default applied, and the report showed no dropped-tool noise. $0.0025. |
+
+Findings fixed in this change. Each has a regression test, except the schema wording:
+
+- The 120 s default task timeout overrode the profile's limit (Aelix's default is 600 s) and
+  timed out a routine proofreading child. An unset `timeout_ms` now leaves an agent's limit to
+  its profile, as the `agent` tool does. Checks default to 600 s.
+- A child that timed out without output left the note `timeout: ` with nothing after it. The note
+  now explains the timeout and suggests raising `timeout_ms` or narrowing the task.
+- Every attempt listed the parent's extension tools (`workflow_*`, `agent`, `aelix_status`) as
+  unavailable to the child. A profile that inherits the parent's tools "requests" all of them,
+  and no child can load extension or MCP tools, so that list is now cleared. A profile that
+  names its tools still sees each requested tool its child did not get.
+- A fan-out's own row showed raw `{{…}}` placeholders, and items under a fixed title could not
+  be told apart. Group titles now mask placeholders, and items under a fixed title get a short
+  label from their item.
+- The parent model wondered in its reasoning how to depend on a fan-out. The schema now states
+  that depending on a `for_each` task waits for all of its items, and that titles accept
+  placeholders.
+- After the crash, the parent blamed the unsettled attempt on a blocked `bash` call. The note now
+  says that Aelix stopped before the child settled. Recovered tool trails use the host's
+  argument format, each attempt in `workflow_status` shows its own outcome symbol, and an empty
+  result is no longer printed.
+
+A second independent review of these fixes found three more defects, each reproduced and fixed
+with a test:
+
+- `overview()` raised `IndexError` for a succeeded task whose answer was only whitespace,
+  breaking `workflow_status` and every `workflow_plan` action. The bug predates this change.
+- Version 1 snapshots wrote the old 120 s default into every task, so restored runs kept it.
+  Migration now drops that value, and the limit defers to the profile.
+- The first fix for the dropped-tool noise also hid tools that a profile had named explicitly.
+
+Host observations that this extension cannot fix (ADR-0003, follow-ups):
+
+- Under an `auto-accept-edits` parent, read-only tasks also run with write authority, and each
+  one shows the write-consent dialog. The public spawn door has no posture ceiling.
+- Every child takes its own consent, and the dialog accepts Enter only after the whole task has
+  been scrolled. A 3-item fan-out meant three dialogs.
+- The panel showed `delegating` for almost the whole run. The host sets a child's current tool
+  only between a tool start and the next turn, so a short tool is rarely visible.
+
+Total model spend for the check was under $0.08, as reported by the host. Panel logs, dialogs
+and scrollback are in `artifacts/live-workflow-2026-10-14/` (local, not committed).
+
 ### Not verified here
 
-No live model or provider was called for this change, and the GitHub Actions matrix has not
-run it (nothing was pushed). Background execution, worktree isolation, run-level cost budgets
-and the host-side delegation door remain open (ADR-0003, follow-ups).
+Background execution, worktree isolation, run-level cost budgets and the host-side delegation
+door remain open (ADR-0003, follow-ups). The live check used a single provider and model.

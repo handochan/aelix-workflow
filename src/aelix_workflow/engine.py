@@ -498,7 +498,20 @@ def record_result(task: Task, attempt: Attempt, result: SubagentResult) -> None:
         task.note = "Stopped from outside the workflow; review side effects before retrying."
     else:
         task.state = "failed"
-        task.note = f"{kind}: {detail}"[:500]
+        task.note = f"{kind}: {_failure_detail(kind, detail, attempt)}"[:500]
+
+
+def _failure_detail(kind: str, detail: str | None, attempt: Attempt) -> str:
+    """The child's own words when it left any; a timed-out child usually leaves none."""
+    text = (detail or "").strip()
+    if text:
+        return text
+    if kind == "timeout":
+        return (
+            f"the child ran out of time after {attempt.elapsed_ms / 1_000:.0f}s; raise "
+            "timeout_ms or narrow the task before retrying"
+        )
+    return failures.describe(kind) or "no detail was reported"
 
 
 def accept(task: Task, attempt: Attempt, result: SubagentResult) -> tuple[str | None, str, str]:

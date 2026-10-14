@@ -8,7 +8,7 @@ from collections import Counter
 from wcwidth import wcswidth, wcwidth
 
 from aelix_workflow.model import Attempt, Task, Workflow
-from aelix_workflow.structured import compact
+from aelix_workflow.structured import compact, mask
 
 WIDGET_KEY = "aelix-workflow:progress"
 STATUS_KEY = "aelix-workflow:status"
@@ -89,8 +89,19 @@ def task_line(run: Workflow, task: Task) -> str:
     if task.spec.repair and task.rounds:
         state += f" | repair {task.rounds}/{task.spec.repair['max_rounds']}"
     attempt = f" #{len(task.attempts)}" if task.attempts else ""
+    # A fan-out's own title is a template; its items carry the rendered titles.
+    title = mask(task.spec.title) if task.spec.for_each else task.spec.title
     # The state/current tool must survive narrow terminals and long model-authored titles.
-    return f"{_SYMBOLS[task.state]} {task.id}{attempt} | {state} | [{task.spec.phase}] {task.spec.title}"
+    return f"{_SYMBOLS[task.state]} {task.id}{attempt} | {state} | [{task.spec.phase}] {title}"
+
+
+def attempt_symbol(attempt: Attempt) -> str:
+    """One attempt's own outcome, which can differ from its task's current state."""
+    if attempt.status == "running":
+        return _SYMBOLS["running"]
+    if {attempt.status, attempt.failure} & {"interrupted", "aborted"}:
+        return _SYMBOLS["interrupted"]
+    return _SYMBOLS["failed"] if attempt.failure else _SYMBOLS["succeeded"]
 
 
 def render_panel(
@@ -150,7 +161,7 @@ def render_details(run: Workflow) -> str:
             if attempt.child_id:
                 line += f" | child {clean(attempt.child_id)}"
             lines.append(line)
-            if attempt.summary:
+            if attempt.summary.strip():
                 lines.append(f"{indent}  result: {clean(attempt.summary)}")
             if attempt.data is not None:
                 lines.append(f"{indent}  data: {clean(compact(attempt.data))[:2_000]}")

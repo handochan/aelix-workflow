@@ -251,7 +251,7 @@ async def test_a_crash_mid_run_restores_the_child_and_an_unknown_outcome(
     task = restored.tasks["inspect"]
     assert task.state == "interrupted"
     assert task.attempts[0].child_id == child_id
-    assert "never settled" in task.note
+    assert "Aelix stopped before this child settled" in task.note
     assert restored.state == "needs_attention"
 
 

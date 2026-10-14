@@ -77,7 +77,10 @@ TASK_SCHEMA = {
         },
         "for_each": {
             "type": "string",
-            "description": "'<dependency>.<field>' naming an array result; one child per item.",
+            "description": "'<dependency>.<field>' naming an array result; one child per item "
+            "(IDs <id>#1, <id>#2, ...). title and prompt may use {{item}}, {{item.field}} and "
+            "{{index}}. Tasks that depend on this task wait for every item and receive all "
+            "item results.",
         },
         "where": _condition("for_each item filter; path is relative to the item ('' = item)."),
         "max_items": {"type": "integer", "minimum": 1, "maximum": 16},
@@ -93,9 +96,20 @@ TASK_SCHEMA = {
             "required": ["task"],
             "additionalProperties": False,
         },
-        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "depends_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "IDs of tasks whose results this task needs. Name a for_each task "
+            "itself, not its items.",
+        },
         "phase": {"type": "string"},
-        "timeout_ms": {"type": "integer", "minimum": 1_000, "maximum": 1_800_000},
+        "timeout_ms": {
+            "type": "integer",
+            "minimum": 1_000,
+            "maximum": 1_800_000,
+            "description": "Optional. Agents default to their profile's limit (Aelix: 600000); "
+            "checks default to 600000.",
+        },
     },
     "required": ["id", "title"],
     "additionalProperties": False,

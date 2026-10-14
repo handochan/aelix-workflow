@@ -7,8 +7,23 @@ every earlier result into the parent's context.
 from __future__ import annotations
 
 from aelix_workflow.engine import Execution
-from aelix_workflow.model import MAX_ATTEMPTS, Task, Workflow, WorkflowError
-from aelix_workflow.panel import _SYMBOLS, attempt_line, clean, clean_block, status_line, task_line
+from aelix_workflow.model import (
+    CHECK_TIMEOUT_MS,
+    MAX_ATTEMPTS,
+    Attempt,
+    Task,
+    TaskSpec,
+    Workflow,
+    WorkflowError,
+)
+from aelix_workflow.panel import (
+    attempt_line,
+    attempt_symbol,
+    clean,
+    clean_block,
+    status_line,
+    task_line,
+)
 from aelix_workflow.structured import compact, describe
 
 REPORT_BUDGET = 12_000
@@ -30,21 +45,18 @@ def run_report(run: Workflow, execution: Execution) -> str:
         lines.append(f"Finished in this run ({len(finished)}):")
         share = max(300, min(1_500, REPORT_BUDGET // len(finished)))
         for task, attempt in finished:
-            symbol = "+" if attempt.status == "ok" and not attempt.failure else "!"
-            line = f"{symbol} {attempt_line(task, attempt)}"
+            line = f"{attempt_symbol(attempt)} {attempt_line(task, attempt)}"
             if not _current(run, task):
                 line += " (from an expansion that a later step replaced)"
             lines.append(line)
-            if attempt.summary:
+            if attempt.summary.strip():
                 lines.append(f"  {_excerpt(attempt.summary, share)}")
             if attempt.data is not None:
                 lines.append(f"  data: {_excerpt(compact(attempt.data), share)}")
             if attempt.failure and attempt.error:
                 lines.append(f"  error: {_excerpt(attempt.error, 400)}")
-            if attempt.dropped_tools:
-                lines.append(
-                    f"  tools unavailable to the child: {', '.join(attempt.dropped_tools)}"
-                )
+            if dropped := _dropped(attempt):
+                lines.append(f"  tools unavailable to the child: {dropped}")
             if attempt.scope_violations:
                 lines.append(
                     "  changed outside its declared writes (concurrent tasks may share blame): "
@@ -78,8 +90,10 @@ def overview(run: Workflow) -> str:
     for task in run.iter_all():
         row = ("  " if task.index else "") + task_line(run, task)
         attempt = task.latest
-        if task.state == "succeeded" and attempt and attempt.summary:
-            row += f" | {_excerpt(attempt.summary.strip().splitlines()[0], 160)}"
+        if task.state == "succeeded" and attempt:
+            first = next(iter(attempt.summary.strip().splitlines()), "")
+            if first:
+                row += f" | {_excerpt(first, 160)}"
         lines.append(row)
     if run.revisions:
         lines.append("Recent replans: " + " | ".join(clean(r)[:120] for r in run.revisions[-3:]))
@@ -94,7 +108,7 @@ def task_detail(run: Workflow, task: Task) -> str:
     head = [f"Task {task.id}", task.state, f"kind {spec.kind}"]
     if spec.kind == "agent":
         head += [f"access {spec.access}", f"profile {spec.profile}"]
-    head += [f"phase {spec.phase}", f"timeout {spec.timeout_ms / 1_000:g}s"]
+    head += [f"phase {spec.phase}", f"timeout {_timeout(spec)}"]
     lines = [" | ".join(head), f"Title: {clean(spec.title)}"]
     if task.note:
         lines.append(f"Note: {clean(task.note)}")
@@ -130,14 +144,14 @@ def task_detail(run: Workflow, task: Task) -> str:
     if task.retired:
         lines.append(f"Earlier expansions: {task.retired} attempt(s) retired")
     for attempt in task.attempts:
-        lines.append(f"{_SYMBOLS.get(task.state, '?')} attempt {attempt_line(task, attempt)}")
+        lines.append(f"{attempt_symbol(attempt)} attempt {attempt_line(task, attempt)}")
         if attempt.child_id:
             lines.append(f"  child: {clean(attempt.child_id)}")
         if attempt.input_tokens or attempt.output_tokens:
             lines.append(f"  tokens: {attempt.input_tokens:,} in / {attempt.output_tokens:,} out")
-        if attempt.dropped_tools:
-            lines.append(f"  tools unavailable to the child: {', '.join(attempt.dropped_tools)}")
-        if attempt.summary:
+        if dropped := _dropped(attempt):
+            lines.append(f"  tools unavailable to the child: {dropped}")
+        if attempt.summary.strip():
             lines.append("  result:\n" + _indent(clean_block(attempt.summary)))
         if attempt.data is not None:
             lines.append(f"  data: {_excerpt(compact(attempt.data), 4_000)}")
@@ -148,6 +162,16 @@ def task_detail(run: Workflow, task: Task) -> str:
         if attempt.scope_violations:
             lines.append("  changed outside writes: " + ", ".join(attempt.scope_violations))
     return "\n".join(lines)
+
+
+def _dropped(attempt: Attempt) -> str:
+    return ", ".join(attempt.dropped_tools)
+
+
+def _timeout(spec: TaskSpec) -> str:
+    if spec.timeout_ms:
+        return f"{spec.timeout_ms / 1_000:g}s"
+    return f"{CHECK_TIMEOUT_MS / 1_000:g}s" if spec.kind == "check" else "profile default"
 
 
 def _current(run: Workflow, task: Task) -> bool:

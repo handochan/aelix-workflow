@@ -160,3 +160,51 @@ def test_the_worst_case_child_prompt_stays_under_the_ceiling():
     run.tasks["v"].repair_context = "라" * 1_300
     prompt = build_prompt(run, run.tasks["v"])
     assert len(prompt.encode("utf-8")) <= MAX_RENDERED_BYTES
+
+
+def test_a_timed_out_attempt_has_no_empty_result_and_keeps_its_own_symbol():
+    run = Workflow.create("Timeout", [spec("a")])
+    task = run.tasks["a"]
+    task.state = "interrupted"
+    task.attempts = [
+        Attempt(1, "timeout", summary="\n", failure="timeout", elapsed_ms=120_200),
+        Attempt(2, "interrupted", failure="interrupted"),
+    ]
+    detail = task_detail(run, task)
+    assert "result:" not in detail
+    assert "! attempt a #1 · timeout" in detail
+    assert "~ attempt a #2" in detail
+    assert "timeout profile default" in detail
+    report = run_report(run, Execution(finished=[(task, task.attempts[0])]))
+    assert "! a #1 · timeout" in report
+    assert "\n  \n" not in report + "\n"
+
+
+def test_a_fan_out_title_is_shown_without_raw_placeholders():
+    run = Workflow.create(
+        "Titles",
+        [review(), {**verify(), "title": "Verify {{index}}: {{item.file}}"}],
+    )
+    group = next(line for line in render_panel(run, width=200) if " verify " in f" {line} ")
+    assert "{{" not in group and "Verify …: …" in group
+    succeed(run.tasks["review"], {"findings": [{"file": "a.py", "severity": "high"}]})
+    run.advance()
+    assert "Verify 1: a.py" in render_details(run)
+
+
+def test_items_of_a_fixed_title_are_told_apart_by_their_item():
+    # Live run: the model gave a fan-out a fixed title, so its three rows read identically.
+    run = Workflow.create("Same", [review(), {**verify(), "title": "Explain the module"}])
+    succeed(run.tasks["review"], {"findings": [{"file": "a.py"}, {"file": "b.py"}]})
+    run.advance()
+    titles = [item.spec.title for item in run.tasks["verify"].items or []]
+    assert titles == ["Explain the module · a.py", "Explain the module · b.py"]
+
+
+def test_a_blank_summary_never_breaks_the_overview():
+    # Review: a succeeded task whose child answered only whitespace made overview() raise.
+    run = Workflow.create("Blank", [spec("a"), spec("b")])
+    run.tasks["a"].state = "succeeded"
+    run.tasks["a"].attempts = [Attempt(1, "ok", summary="\n")]
+    text = overview(run)
+    assert "+ a #1 | succeeded | [Work] a\n" in text + "\n"

@@ -84,7 +84,7 @@ async def test_a_settled_success_is_recovered_instead_of_rerun(tmp_path):
     assert task.data == {"findings": [{"file": "route.py"}]}
     assert task.output == "Found one."
     assert task.attempts[0].cost == 0.25
-    assert task.attempts[0].tool_trail == 'edit({"path": "route.py"}) ok'
+    assert task.attempts[0].tool_trail == "edit(route.py) ok"
     assert "Recovered after a restart" in task.note
     assert run.state == "awaiting_review"
 
@@ -99,8 +99,8 @@ async def test_the_host_marker_finds_a_child_the_workflow_never_recorded(tmp_pat
     assert notes == ["a #1: started before the restart"]
     assert task.state == "interrupted"
     assert task.attempts[0].child_id == "sub-9"
-    assert "never settled; it ran edit" in task.note
-    assert task.attempts[0].tool_trail == 'edit({"path": "route.py"}) (no result)'
+    assert "not a failure of the child); it ran edit" in task.note
+    assert task.attempts[0].tool_trail == "edit(route.py) (no result)"
 
 
 async def test_settled_failures_and_cancellations(tmp_path):

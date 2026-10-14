@@ -194,8 +194,10 @@ its session file shows.
 
 - 1–4 concurrent tasks, at most 64 tasks including fan-out items, 16 items per fan-out,
   128 attempts per run, and 16 admissions per user prompt shared across all workflows.
-  Timeouts are 1–1,800 seconds per task. A child prompt is at most 60,000 UTF-8 bytes;
-  dependency evidence is cut at character boundaries to fit.
+  Timeouts are 1–1,800 seconds per task. Without `timeout_ms` an agent task gets its
+  profile's limit (Aelix default 600 seconds), as the `agent` tool does; checks get 600.
+  A child prompt is at most 60,000 UTF-8 bytes; dependency evidence is cut at character
+  boundaries to fit.
 - Every child uses the host's public consent-taking `SubagentRuntime.spawn` contract. Profiles
   resolve with `allow_project=False`; no private grants, subprocess launcher, or permission
   widening is introduced. The parent must have an active `agent` tool.

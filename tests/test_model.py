@@ -157,6 +157,15 @@ def test_version_1_snapshots_migrate_with_failure_kinds():
     assert Workflow.restore(run.to_dict()).to_dict() == run.to_dict()
 
 
+def test_version_1_default_timeouts_defer_to_the_profile():
+    # Version 1 wrote its 120 s default into every task; only other values were choices.
+    raw = v1_snapshot()
+    raw["tasks"][1]["spec"]["timeout_ms"] = 900_000
+    run = Workflow.restore(raw)
+    assert run.tasks["a"].spec.timeout_ms is None
+    assert run.tasks["b"].spec.timeout_ms == 900_000
+
+
 @pytest.mark.parametrize(
     "mutate, match",
     [
@@ -185,3 +194,16 @@ def test_a_graph_at_the_task_limit_fits_the_attempt_budget():
     run.refresh_state()
     run.finish("All 64 tasks verified.")
     assert Workflow.restore(run.to_dict()).state == "completed"
+
+
+def test_an_unset_timeout_defers_to_the_profile():
+    from aelix_workflow.model import TaskSpec
+
+    unset = TaskSpec.parse(spec("a"))
+    assert unset.timeout_ms is None
+    assert "timeout_ms" not in unset.to_dict()
+    explicit = TaskSpec.parse({**spec("b"), "timeout_ms": 120_000})
+    assert explicit.timeout_ms == 120_000
+    assert TaskSpec.parse(explicit.to_dict()).timeout_ms == 120_000
+    with pytest.raises(WorkflowError, match="timeout_ms"):
+        TaskSpec.parse({**spec("c"), "timeout_ms": 500})

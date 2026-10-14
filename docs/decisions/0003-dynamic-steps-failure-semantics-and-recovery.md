@@ -130,6 +130,9 @@ channel to reattach to, and `pdeathsig` is Linux-only.
 
 64 tasks including items, 128 attempts per run (retired fan-out attempts included), 16 items per
 fan-out, 16 admissions per user prompt, 1–1,800 seconds per task (the `agent` tool's ceiling).
+An agent task without `timeout_ms` gets its profile's limit, as the `agent` tool does (Aelix
+default 600 seconds); a fixed workflow default of 120 seconds timed out routine children in the
+live check. Checks default to 600 seconds.
 
 ## Review
 
@@ -143,6 +146,16 @@ session, run reports mixing expansions, a case-folding offset in result extracti
 fixed with regression tests; the command-approval finding is addressed by per-run, informed
 consent as described above rather than by containment.
 
+A live check with a real model (`docs/verification.md`) then ran planning, fan-out, a write
+task, a check with a repair round, a timeout, a parent replan, a `kill -9` of Aelix during a
+child, restart recovery and `/workflow continue`. It found six more defects: the 120 s
+default timeout, an empty timeout note, extension tools reported as withheld from every child,
+raw placeholders in fan-out rows, undocumented fan-out dependencies, and a recovery note that
+let the parent blame the wrong cause. All are fixed, and all but the schema wording have
+regression tests. A second review of those fixes found three more, also fixed with tests: an
+overview crash on a whitespace-only answer, version 1 snapshots keeping the old 120 s default,
+and a dropped-tool filter that hid tools a profile had requested.
+
 ## Consequences and follow-ups
 
 - The extension still uses the host's user-typed `runtime.spawn` door. It now halts on
@@ -151,6 +164,10 @@ consent as described above rather than by containment.
   model-driven per-prompt budget (the workflow's 16 are separate from the `agent` tool's 12),
   respects a closed door instead of reopening it, and can take one consent for a whole plan
   (`request_spawn_consent_batch` exists privately). This repository does not change the host.
+- The live check showed two more host-side limits. A read task under an `auto-accept-edits`
+  parent runs with write authority and asks for write consent, because the public door has no
+  posture ceiling. Every child asks its own consent, and the dialog accepts Enter only after the
+  whole task has been read. Both belong to the same extension delegation door.
 - Background execution needs a session-owned host primitive (ADR-0197 forbids tasks that
   outlive the session) and depends on the pause/halt semantics above.
 - Worktree isolation remains open; declared scopes plus serialization cover overlapping edits.

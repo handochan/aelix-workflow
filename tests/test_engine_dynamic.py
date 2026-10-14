@@ -569,3 +569,19 @@ async def test_a_report_keeps_results_of_a_replaced_expansion_apart():
     assert "Finished in this run (7):" in text
     assert text.count("(from an expansion that a later step replaced)") == 2
     assert "verified a.py" in text and "verified b.py" in text and "verified c.py" in text
+
+
+async def test_a_timeout_without_output_explains_itself():
+    # Live run: a timed-out child left no summary or error, and the note read "timeout: ".
+    run = Workflow.create("Slow", [spec("a")])
+
+    async def delegate(task, _prompt, _on_event):
+        return failed(task, "timeout", None, elapsed_ms=120_200)
+
+    await execute(run, delegate)
+    task = run.tasks["a"]
+    assert task.attempts[0].failure == "timeout"
+    assert task.note == (
+        "timeout: the child ran out of time after 120s; raise timeout_ms or narrow the task "
+        "before retrying"
+    )

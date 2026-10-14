@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import shlex
@@ -35,7 +36,14 @@ from aelix_workflow.activation import (
     requested_workflow,
 )
 from aelix_workflow.engine import CheckOutcome, CheckRefused, WorkflowEngine
-from aelix_workflow.model import WRITE_TOOLS, Attempt, Task, Workflow, WorkflowError
+from aelix_workflow.model import (
+    CHECK_TIMEOUT_MS,
+    WRITE_TOOLS,
+    Attempt,
+    Task,
+    Workflow,
+    WorkflowError,
+)
 from aelix_workflow.panel import STATUS_KEY, WIDGET_KEY, render_details, render_panel, status_line
 from aelix_workflow.schema import PLAN_SCHEMA, RUN_SCHEMA, STATUS_SCHEMA
 from aelix_workflow.workspace import GitWorkspace
@@ -415,7 +423,10 @@ class WorkflowExtension:
             )
         started = time.monotonic()
         result = await self.api.exec(
-            command[0], list(command[1:]), cwd=self._cwd_now(), timeout_ms=task.spec.timeout_ms
+            command[0],
+            list(command[1:]),
+            cwd=self._cwd_now(),
+            timeout_ms=task.spec.timeout_ms or CHECK_TIMEOUT_MS,
         )
         output = "\n".join(part for part in (result.stdout, result.stderr) if part.strip())
         return CheckOutcome(
@@ -474,9 +485,15 @@ class WorkflowExtension:
                 # This public door does not charge the host agent-tool budget, so this
                 # extension enforces a separate, shared 16-per-user-prompt admission cap.
                 resolved = profiles.get(task.spec.profile) or self._resolve(task.spec.profile)
-                return await self.api.runtime.subagents.spawn(  # type: ignore[union-attr]
+                result = await self.api.runtime.subagents.spawn(  # type: ignore[union-attr]
                     resolved, prompt, timeout_ms=task.spec.timeout_ms, on_event=on_event
                 )
+                if resolved.profile.tools is None and result.dropped_tools:
+                    # An inheriting profile "requests" the parent's whole grant, so the host
+                    # lists every extension and MCP tool, none of which a child can load.
+                    # A profile that names its tools keeps the list: it asked for each one.
+                    result = dataclasses.replace(result, dropped_tools=())
+                return result
 
             execution = await self.engine.execute(
                 run,

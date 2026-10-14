@@ -35,7 +35,11 @@ class RecordingChannel:
             if on_stream is not None:
                 on_stream(child.stream)
             child.state = "done"
-        return SubagentResult(plan.id, plan.resolved.name, True, "ok", "checked route.py:12")
+        # As the real channel reports it: what the profile requested but the child cannot have.
+        dropped = narrow_tools(plan.resolved.profile, plan.parent_tools).dropped
+        return SubagentResult(
+            plan.id, plan.resolved.name, True, "ok", "checked route.py:12", dropped_tools=dropped
+        )
 
 
 class RecordingUI:
@@ -65,13 +69,15 @@ async def bench(
     approval="inherit",
     project_trusted=False,
     mode="on",
+    tools="[read, write]",
 ):
     agent_dir = tmp_path / "agent"
     profiles = agent_dir / "agents"
     profiles.mkdir(parents=True)
     (profiles / "reviewer.md").write_text(
-        "---\nname: reviewer\ndescription: Inspect and verify evidence\ntools: [read, write]\n"
-        f"approval_mode: {approval}\n---\nRead the evidence.\n"
+        "---\nname: reviewer\ndescription: Inspect and verify evidence\n"
+        + (f"tools: {tools}\n" if tools is not None else "")
+        + f"approval_mode: {approval}\n---\nRead the evidence.\n"
     )
     session = Session(
         await JsonlSessionStorage.create(
@@ -334,4 +340,37 @@ async def test_prompt_admission_limit_is_shared_across_workflows(tmp_path):
     await b.controller.before_agent_start(SimpleNamespace(system_prompt="base"), None)
     await b.controller.run({"run_id": b.controller.selected}, context)
     assert len(b.channel.plans) == 17
+    await b.harness.dispose()
+
+
+async def test_an_unset_timeout_reaches_the_host_as_its_own_default(tmp_path):
+    # Live run: the workflow's former 120 s default overrode the profile's (Aelix: 600 s).
+    b = await bench(tmp_path)
+    await b.harness.prompt("Review using a workflow")
+    assert len(b.channel.plans) == 1
+    assert b.channel.plans[0].timeout_ms is None
+    await b.harness.dispose()
+
+
+async def test_an_inheriting_profile_reports_no_withheld_tools(tmp_path):
+    # Live run: the host lists every extension tool of an inheriting profile as withheld.
+    b = await bench(tmp_path, tools=None)
+    await b.harness.prompt("Review using a workflow")
+    assert narrow_tools(
+        b.channel.plans[0].resolved.profile, b.channel.plans[0].parent_tools
+    ).dropped
+    run = b.controller.runs[b.controller.selected]
+    assert run.tasks["inspect"].attempts[0].dropped_tools == []
+    await b.harness.dispose()
+
+
+async def test_a_profile_learns_which_requested_tools_its_child_lacked(tmp_path):
+    b = await bench(tmp_path, tools="[read, web_fetch]")
+    await b.harness.prompt("Review using a workflow")
+    child = b.channel.plans[0]
+    expected = list(narrow_tools(child.resolved.profile, child.parent_tools).dropped)
+    run = b.controller.runs[b.controller.selected]
+    # A profile that names its tools asked for each one, so the host's list is kept whole.
+    assert run.tasks["inspect"].attempts[0].dropped_tools == expected
+    assert "web_fetch" in expected
     await b.harness.dispose()

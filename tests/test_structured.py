@@ -167,3 +167,14 @@ def test_case_folding_text_before_the_result_does_not_shift_it():
     assert structured.extract_json(reply) == ({"ok": 1}, "İİİ TAMAM.")
     with pytest.raises(ValueError, match="nested too deeply"):
         structured.extract_json("```json\n" + "[" * 100_000 + "]" * 100_000 + "\n```")
+
+
+def test_item_labels_name_an_item_briefly():
+    from aelix_workflow.structured import label
+
+    assert label({"functions": ["clamp"], "path": "calc/ops.py"}) == "calc/ops.py"
+    assert label({"count": 3, "note": "  two\nlines "}) == "3"
+    assert label({"flag": True, "x": "kept"}) == "kept"
+    assert label("calc/text.py") == "calc/text.py"
+    assert label(["no", "label"]) == "" and label(True) == ""
+    assert label("가" * 100, limit=10) == "가" * 9 + "…"

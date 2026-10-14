@@ -11,7 +11,6 @@ the tool calls its session file shows, for an informed retry decision.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import dataclass
@@ -159,6 +158,29 @@ async def read_transcript(receipt: Receipt, parent_path: str | None) -> Transcri
     return None
 
 
+# The host's own trail names a call by its first argument that *is* the call
+# (``aelix_agents.stream._render_args``); recovered trails read the same way.
+_ARGUMENT_PREFERENCE = ("path", "file_path", "command", "pattern", "query", "url", "cmd")
+
+
+def _arguments(arguments: Any) -> str:
+    if not isinstance(arguments, dict) or not arguments:
+        return ""
+    for key in _ARGUMENT_PREFERENCE:
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            text = value
+            break
+    else:
+        text = ", ".join(
+            f"{key}={value}"
+            for key, value in arguments.items()
+            if isinstance(value, str | int | float | bool)
+        )
+    text = "".join(c if c.isprintable() else " " for c in text)
+    return text if len(text) <= 120 else text[:119] + "…"
+
+
 def _transcript(entries: list[Any]) -> Transcript:
     answer = ""
     calls: dict[str, str] = {}
@@ -174,9 +196,7 @@ def _transcript(entries: list[Any]) -> Transcript:
                 answer = "\n".join(texts)
             for block in message.content:
                 if isinstance(block, ToolCallContent):
-                    arguments = json.dumps(block.input, ensure_ascii=False, default=str)
-                    arguments = "".join(c if c.isprintable() else " " for c in arguments)
-                    calls[block.tool_call_id] = f"{block.tool_name}({arguments[:120]})"
+                    calls[block.tool_call_id] = f"{block.tool_name}({_arguments(block.input)})"
                     order.append(block.tool_call_id)
         elif isinstance(message, ToolResultMessage):
             verdicts[message.tool_call_id] = "FAILED" if message.is_error else "ok"
@@ -271,10 +291,13 @@ async def reconcile(
                     if attempt.tool_trail:
                         names = [line.split("(", 1)[0] for line in attempt.tool_trail.splitlines()]
                         ran = "it ran " + ", ".join(dict.fromkeys(names))
+                    # Name the cause: a live model misread a bare "never settled" as the
+                    # child's own failure and blamed a tool it had tried.
                     lead = (
                         "The child was stopped mid-run"
                         if status == "cancelled"
-                        else "Outcome unknown: the child started but never settled"
+                        else "Outcome unknown: Aelix stopped before this child settled (exit "
+                        "or crash, not a failure of the child)"
                     )
                     task.note = f"{lead}; {ran}. Review side effects before retrying."[:500]
                 continue

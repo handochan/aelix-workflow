@@ -29,6 +29,7 @@ MAX_ITEMS = 16
 MAX_PROMPT_BYTES = 24_000
 MAX_ITEM_PROMPT_BYTES = MAX_PROMPT_BYTES
 MAX_TIMEOUT_MS = 1_800_000
+CHECK_TIMEOUT_MS = 600_000
 SUMMARY_LIMIT = 4_000
 TRAIL_LIMIT = 4_096
 MAX_DATA_BYTES = 16_000
@@ -183,7 +184,7 @@ class TaskSpec:
     profile: str = ""
     depends_on: tuple[str, ...] = ()
     phase: str = "Work"
-    timeout_ms: int = 120_000
+    timeout_ms: int | None = None
     kind: str = "agent"
     access: str = "read"
     writes: tuple[str, ...] = ()
@@ -220,8 +221,11 @@ class TaskSpec:
             "title": text_field(raw.get("title"), "task.title", limit=300),
             "depends_on": tuple(deps),
             "phase": text_field(raw.get("phase", "Work"), "task.phase", limit=100),
-            "timeout_ms": integer(
-                raw.get("timeout_ms", 120_000), "timeout_ms", 1_000, MAX_TIMEOUT_MS
+            # Unset leaves an agent's limit to its profile (Aelix: 600 s), as the agent tool does.
+            "timeout_ms": (
+                integer(raw["timeout_ms"], "timeout_ms", 1_000, MAX_TIMEOUT_MS)
+                if "timeout_ms" in raw
+                else None
             ),
             "kind": kind,
         }
@@ -779,10 +783,13 @@ class Workflow:
 
     @staticmethod
     def _item(group: Task, value: Any, number: int) -> Task:
+        title = structured.render(group.spec.title, value, number)
+        if title == group.spec.title and (name := structured.label(value)):
+            title = f"{title} · {name}"
         spec = dataclasses.replace(
             group.spec,
             id=f"{group.id}#{number}",
-            title=structured.clip_bytes(structured.render(group.spec.title, value, number), 300),
+            title=structured.clip_bytes(title, 300),
             prompt=structured.clip_bytes(
                 structured.render(group.spec.prompt, value, number), MAX_ITEM_PROMPT_BYTES
             ),
@@ -1127,6 +1134,9 @@ def _restore_extras(task: Task, raw: dict[str, Any]) -> None:
         raise WorkflowError("An expanded for_each task needs its expansion generation.")
 
 
+_V1_DEFAULT_TIMEOUT_MS = 120_000
+
+
 def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
     """Version 1 attempts lack failure kinds and the evidence fields added in version 2."""
     tasks = raw.get("tasks")
@@ -1148,5 +1158,11 @@ def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
             if status not in {"ok", "running"}:
                 failure = status if status in FAILURE_KINDS else "error"
             upgraded.append({**copy.deepcopy(_ATTEMPT_DEFAULTS), **attempt, "failure": failure})
-        migrated.append({**task, "attempts": upgraded})
+        spec = task.get("spec")
+        timeout = spec.get("timeout_ms") if isinstance(spec, dict) else None
+        if type(timeout) is int and timeout == _V1_DEFAULT_TIMEOUT_MS:
+            # Version 1 wrote every field, so its default is indistinguishable from a choice;
+            # like an unset limit now, it defers to the profile.
+            spec = {key: value for key, value in spec.items() if key != "timeout_ms"}
+        migrated.append({**task, "spec": spec, "attempts": upgraded})
     return {**raw, "schema_version": SCHEMA_VERSION, "tasks": migrated}
