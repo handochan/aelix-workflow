@@ -102,9 +102,13 @@ async def test_abort_joins_every_child_and_preserves_finished_results():
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(owner, 1)
     assert set(drained) == {"a", "b"}
-    assert all(t.state == "interrupted" for t in run.tasks.values())
-    assert run.state == "cancelled"
+    assert run.tasks["a"].state == run.tasks["b"].state == "interrupted"
+    # Work that never started has no side effects to review, so it stays pending.
+    assert run.tasks["c"].state == "pending"
+    assert not run.tasks["c"].attempts
+    assert run.state == "needs_attention"
     assert not engine._members
+    run.amend([spec("d")], replace=False, reason="Still editable after a pause")
 
 
 async def test_prompt_budget_and_run_budget_refuse_new_children():

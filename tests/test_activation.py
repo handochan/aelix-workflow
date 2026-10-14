@@ -241,3 +241,17 @@ async def test_late_ui_binding_displays_default_mode_before_any_request(tmp_path
     writes = len(ui.status)
     b.controller.api.events.emit("ui:list-modules", object())
     assert len(ui.status) == writes
+
+
+async def test_requests_that_cannot_use_workflows_skip_the_usage_guide(tmp_path):
+    b = await bench(tmp_path, mode="off")
+    plain = await b.controller.before_agent_start(
+        SimpleNamespace(system_prompt="base", prompt="Inspect a file"), None
+    )
+    explicit = await b.controller.before_agent_start(
+        SimpleNamespace(system_prompt="base", prompt="Use a workflow to inspect a file"), None
+    )
+    assert "for_each" not in plain.system_prompt
+    assert "for_each" in explicit.system_prompt
+    assert len(plain.system_prompt) < 1_000
+    await b.harness.dispose()

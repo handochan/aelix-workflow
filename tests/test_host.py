@@ -92,6 +92,8 @@ async def bench(
         cwd=str(tmp_path),
         channel=channel,
         project_trusted=project_trusted,
+        # As cli/entry.py wires it, so the host records its spawn receipts (#199).
+        session=lambda: session,
     )
     agents(ExtensionAPI(agent_record, runtime))
     record = Extension(name="aelix-workflow")
@@ -252,7 +254,13 @@ async def test_missing_identity_preflight_and_missing_run_id_start_no_children(t
     result = await b.controller.plan(
         {"action": "create", "goal": "Review", "tasks": [{**spec(), "profile": "missing"}]}, context
     )
-    assert not result.is_error
+    # An unknown identity is refused while the plan is written.
+    assert result.is_error
+    assert "missing" in result.content[0].text
+    assert not b.controller.runs
+    await b.controller.plan({"action": "create", "goal": "Review", "tasks": [spec()]}, context)
+    # A profile deleted between planning and execution is still refused before any spawn.
+    (tmp_path / "agent" / "agents" / "reviewer.md").unlink()
     result = await b.controller.run({"run_id": b.controller.selected}, context)
     assert result.is_error
     assert not b.channel.plans
@@ -281,7 +289,7 @@ async def test_trusted_project_identity_is_still_refused_for_model_workflow(tmp_
     resolved = b.runtime.subagents.resolve_profile("project-reviewer", allow_project=True)
     assert resolved.scope == "project"
     context = ToolExecutionContext()
-    await b.controller.plan(
+    result = await b.controller.plan(
         {
             "action": "create",
             "goal": "Review",
@@ -289,8 +297,8 @@ async def test_trusted_project_identity_is_still_refused_for_model_workflow(tmp_
         },
         context,
     )
-    result = await b.controller.run({"run_id": b.controller.selected}, context)
     assert result.is_error
+    assert not b.controller.runs
     assert not b.channel.plans
     await b.harness.dispose()
 

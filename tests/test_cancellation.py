@@ -26,8 +26,10 @@ async def test_harness_abort_reaches_workflow_and_joins_child(tmp_path):
     await asyncio.wait_for(owner, 2)
     assert drained.is_set()
     run = b.controller.runs[b.controller.selected]
-    assert run.state == "cancelled"
+    # Ctrl+C pauses the run: the interrupted task needs an explicit retry, the graph stays editable.
+    assert run.state == "needs_attention"
     assert run.tasks["inspect"].state == "interrupted"
+    assert run.tasks["inspect"].attempts[-1].status == "interrupted"
     assert not b.controller.engine._members
     assert not b.runtime.subagents.list()
     await b.harness.dispose()

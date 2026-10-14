@@ -221,3 +221,104 @@ in the user's prompt or CLI exit code 0 as success.
 
 The live model and transport-simulation checks establish distinct, bounded evidence. They do
 not establish full feature parity with Claude Code or Deep Agents' interpreter orchestration.
+
+## Dynamic steps, failure semantics and recovery (2026-10-14)
+
+Scope: [ADR-0003](decisions/0003-dynamic-steps-failure-semantics-and-recovery.md). Host source
+checkout at `64b82af7`; CI still pins `28dbcaf4`, and every host API used here exists there.
+
+### Defects reproduced before the change
+
+Scratch probes ran against `c327f40` (extension engine/model with fake delegates; the stop probe
+used the real host runtime through the test bench, with only the child transport faked):
+
+| # | Before | After |
+| --- | --- | --- |
+| 1 | After `stop_all`, tasks `b`, `c` still spawned and the host door went from closed to open | Only `a` spawned; the door stays closed; `a` interrupted, `b`/`c` pending |
+| 2 | Identical HTTP 402 on every child launched 6/6 tasks | 2/6 (the first concurrent wave); the run halts as a blocker |
+| 3 | Write task run in `plan` mode: `succeeded`, no posture recorded | `failed[read_only]`; posture, dropped tools and tool trail recorded |
+| 4 | Last persisted attempt while a child ran: `child_id: None` | An attempt record with the child ID is written as soon as the child starts |
+| 5 | Two Korean dependency results: successor failed on the byte budget, deterministically | Succeeds; six such results are cut at character boundaries within 60,000 bytes |
+| 6 | A 40-task graph stopped at 32 attempts and could not finish | All 40 succeed; a 64-task graph fits the 128-attempt budget |
+| 7 | Ctrl+C: whole run `cancelled`, unstarted tasks flagged for side-effect review, add/revise refused | Running task interrupted, others pending, run `needs_attention` and editable |
+| 8 | 10 tasks × 3 attempts: 121,200 characters resent by run/status | Overview 2,117; a run report with two new results 3,146 |
+| 9 | One added attempt field made restore fail | Schema 2 restores, schema 1 migrates; within a version unknown fields are refused |
+
+### Automated checks
+
+`uv run --no-sync pytest -q`: **239 passed** (70 before this change; three of those were
+updated for the deliberate changes above: Ctrl+C pauses, and unknown or project-scoped profiles
+are now refused while the plan is written). Ruff lint/format and Pyright: clean.
+
+The suite also passed (**238**, all but the packaging test) on **CPython 3.11.15 against the
+CI-pinned host `28dbcaf4`**, installed from a `git archive` of that revision into a scratch
+environment. The packaging test builds with the project's own uv environment and ran in the
+main environment. `uv build` then `scripts/verify_wheel.py`: the wheel contains every new
+module, imports from site-packages, and `aelix extension verify` reports the endpoint BOUND.
+
+New coverage includes the JSON Schema subset, conditions, templates and result extraction;
+failure classification; scope overlap and git observation in a real repository; for_each,
+when, repair, pause and cancel at the graph level; engine halting, bounded side-effect-free
+retries, read-only and structured-output acceptance, fan-out aggregation, write-scope
+serialization, the byte budget, delta reports; schema 1 migration and schema 2 strictness;
+recovery from real session files (settled success, marker-only receipts, failures,
+cancellations, unreadable answers, files outside the parent directory). Host-level tests use
+the real harness, delegation runtime and JSONL sessions with the host's receipt wiring:
+`stop_all` halting, one-time command approval, denied and headless checks, the write-tool
+preflight, read-only children, task detail and delta reports, crash-time restoration with and
+without the workflow's own attempt record, and `/workflow continue`.
+
+### Independent review
+
+A separate reviewer read the whole change against the host source and reported twelve defects,
+each with a probe that reproduced it. Every probe was re-run here before and after the fix:
+
+| Finding | Before | After |
+| --- | --- | --- |
+| Restart adopted an earlier expansion's receipt for a re-expanded item | new `verify#1` became `succeeded` with the old child's answer | item stays pending; expansions are numbered and matched |
+| Second Ctrl+C during child teardown | run stayed `running`, stale members made the next run cancel itself | run `needs_attention`, no members left, next run completes |
+| Repair re-ran declined, skipped and interrupted work | `deploy` declined → spawned again; `risky`, `migrate` ran | only stale results and failed checks rerun |
+| `git status` before consent ran a repository `core.fsmonitor` | hook executed | `core.fsmonitor=false`, lock-free, trusted projects only |
+| Check approval bound to the command line only | edited code ran with no prompt | approval per workflow; the dialog names the writers that can change the code (residual risk, documented) |
+| 100,000-deep JSON from one child | `RecursionError` drained the run, sibling interrupted | that task fails as `invalid_output`, sibling succeeds |
+| Failed child's prose about HTTP 401 | halted the run as a blocker | prose after a model reply is `error`; stderr-only startup failures are still blockers |
+| Session in a repository subdirectory | in-scope edit reported, dirty out-of-scope edit missed | paths mapped from the repository root |
+| Re-expanded group in one run's report | one result shown twice, two lost | all attempts shown; replaced ones labeled |
+| `İ` before the result block | remainder corrupted or valid result refused | located without case folding |
+| `stop_on_failure` and a failed fan-out | the next task still launched | the run halts |
+| Worst-case child prompt | 65,764 bytes | ≤ 60,000 bytes; `writes` bounded in bytes |
+
+The review's test-quality notes were addressed too: the approval test now asserts that the
+approved command is absent from the second dialog, an engine-level test proves a check never
+overlaps a writer, and the failure tests assert the corrected classification. A tampered
+snapshot whose fan-out claimed success without items is now refused.
+
+### Real terminal simulation
+
+Started the actual Aelix TUI (`aelix --offline --no-session -e examples/tui_demo.py`) in an
+isolated tmux server at 100 × 32 and invoked `/workflow-demo`. Only child transport and the
+check result were simulated. Captures `artifacts/tui-dynamic-*.txt` show:
+
+```text
+> verify | running: 0/3 items, 3 running | [Verify] Verify {{item.file}}
+↳ > verify#1 #1 | running: read | 0.0s | 380 ctx tokens | [Verify] Verify src/auth/session.py
+o fix | pending: waiting for verify | [Fix] Fix the confirmed defects
+
+> tests #1 | running: check | 0.0s | [Check] Run the auth tests
+
+> fix #2 | running: edit | 2.1s | 1,520 ctx tokens | [Fix] Fix the confirmed defects
+o tests #1 | pending: waiting for fix | repair 1/2 | [Check] Run the auth tests
+
+Workflow d2bfa3c0a0ce | completed | 4/4 succeeded
++ tests #2 | succeeded | repair 1/2 | [Check] Run the auth tests
+```
+
+The first capture also exposed two display defects, both fixed before the captures above: a
+group showed `pending` for up to one progress interval after its items started, and a repaired
+check rendered `succeeded: succeeded`.
+
+### Not verified here
+
+No live model or provider was called for this change, and the GitHub Actions matrix has not
+run it (nothing was pushed). Background execution, worktree isolation, run-level cost budgets
+and the host-side delegation door remain open (ADR-0003, follow-ups).

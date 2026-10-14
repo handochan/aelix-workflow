@@ -4,10 +4,12 @@ An Aelix extension for adaptive task decomposition, agent delegation, result-bas
 and live progress in the TUI. The parent agent builds a task graph, executes it, examines the
 results, and changes the plan when new evidence calls for it.
 
-The first version uses a validated task graph instead of executing generated Python or
-JavaScript. Independent ready tasks run concurrently. A successor starts as soon as its own
-dependencies succeed; it does not wait for unrelated work. After execution, the parent can add
-new investigations, revise invalid assumptions, retry an interrupted task, and add verification.
+It uses a validated task graph instead of executing generated Python or JavaScript.
+Independent ready tasks run concurrently. A successor starts as soon as its own dependencies
+succeed; it does not wait for unrelated work. Declarative dynamic steps let the graph adapt
+inside one run without another parent turn: structured results, one child per result item,
+conditional branches, verification commands and bounded repair loops. Between runs, the parent
+can add new investigations, revise invalid assumptions, retry interrupted work, and add checks.
 
 ## Develop and run
 
@@ -35,12 +37,17 @@ profiles are required for delegation. In the TUI:
 ```text
 /workflow inspect this repository, identify the highest-impact defect, fix it, and verify the fix
 /workflow status
+/workflow status <run_id> <task_id>
+/workflow continue
 /workflow hide
 /workflow show
 /workflow mode
 /workflow mode on
 /workflow mode off
 ```
+
+`/workflow continue [run_id]` asks the agent to resume a paused or budget-limited run; it is an
+explicit workflow request, so it also works in mode off.
 
 ## Workflow activation
 
@@ -71,9 +78,14 @@ Mode changes are recorded in the **current session** using the host's asynchrono
 append API. `/resume`, `/reload` and `/fork` restore the preference on the selected branch.
 `/new` starts with the default off; `--no-session` keeps the preference only in memory.
 
-The panel above the editor shows the goal, revision, workflow state, task states, dependency
-waits, current child tool, elapsed time and context tokens. Running and failed tasks appear first.
-`/workflow status` includes all tasks and their attempt history. Ctrl+C interrupts execution.
+The panel above the editor shows the goal, revision, workflow state, task states, failure kinds,
+dependency and shared-file waits, fan-out progress, repair rounds, current child tool, elapsed
+time, context tokens and spend. Running items appear under their group; running and failed tasks
+come first. `/workflow status` includes all tasks and their attempt history.
+
+Ctrl+C **pauses** execution: running work becomes interrupted and needs an explicit retry after
+its side effects are reviewed; work that never started stays pending, and the graph stays
+editable. `workflow_plan(action='cancel')` ends a run.
 
 The host's permission mode and each profile's `approval_mode` determine write authority.
 A default-mode parent with an inherited profile produces read-only children. For implementation
@@ -102,8 +114,8 @@ uv run --no-sync aelix --agents
 | Tool | Purpose |
 | --- | --- |
 | `workflow_plan` | `create`, `add`, `revise`, `retry`, `skip`, `cancel`, `finish` |
-| `workflow_run` | Execute the ready graph and return bounded results for the next decision |
-| `workflow_status` | Inspect state, waiting reasons, outputs and prior attempts |
+| `workflow_run` | Execute the ready graph; report only what finished in this run. `stop_on_failure` starts nothing new after a failure |
+| `workflow_status` | Overview of states and waits, or one task's attempts, data and tool trail with `task_id` |
 
 Example plan (use profile names that actually exist in your Aelix installation):
 
@@ -124,10 +136,66 @@ Pass the returned `run_id` to `workflow_run`. Once it returns, inspect its resul
 or revising tasks. `finish` requires a conclusion and refuses graphs with unresolved work.
 An agent's successful return is execution evidence; it does not prove all acceptance checks passed.
 
+## Dynamic steps
+
+These fields make a graph adapt within one `workflow_run`. Paths and placeholders are checked
+against the declared schemas when the plan is written.
+
+| Field | Effect |
+| --- | --- |
+| `output_schema` | JSON Schema subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, length/size/number bounds). The child ends with a `json` fence that must satisfy it; otherwise the task fails as `invalid_output`. Successors receive the data |
+| `for_each`, `where`, `max_items` | Run one child per element of a dependency's array result (`verify#1`, `verify#2`, …), optionally filtered. More than `max_items` (≤16) fails the group instead of dropping work. Prompts may use `{{item}}`, `{{item.field}}`, `{{index}}` |
+| `when` | Skip the task when a condition on a dependency result is false. Such a skip satisfies successors; a manual skip does not |
+| `kind: "check"`, `command` | Run a command (argv, no shell) in the project and pass on exit code 0. The user approves each distinct command once per workflow, before any child starts |
+| `repair` | On a failed check, rerun an upstream agent task with the failure output, then re-check, up to `max_rounds` (≤3) |
+| `access`, `writes` | `access: "write"` marks a task that must change files; `writes` lists the globs it owns |
+
+```json
+{
+  "action": "create",
+  "goal": "Find, fix and verify authentication defects",
+  "max_concurrency": 3,
+  "tasks": [
+    {"id": "review", "title": "Review the auth boundary", "profile": "reviewer", "prompt": "List concrete, reproducible defects.",
+     "output_schema": {"type": "object", "required": ["findings"], "properties": {"findings": {"type": "array", "items": {"type": "object", "required": ["file", "claim"], "properties": {"file": {"type": "string"}, "claim": {"type": "string"}}}}}}},
+    {"id": "verify", "title": "Verify {{item.file}}", "profile": "reviewer", "depends_on": ["review"], "for_each": "review.findings", "max_items": 6,
+     "prompt": "Reproduce: {{item.claim}} in {{item.file}}. Report confirmed true or false.",
+     "output_schema": {"type": "object", "required": ["confirmed"], "properties": {"confirmed": {"type": "boolean"}}}},
+    {"id": "fix", "title": "Fix confirmed defects", "profile": "implementer", "depends_on": ["verify"], "writes": ["src/auth/**", "tests/auth/**"],
+     "when": {"path": "verify", "op": "contains", "value": "{\"confirmed\":true}"}, "prompt": "Fix every confirmed defect and add regression tests."},
+    {"id": "tests", "title": "Run the auth tests", "kind": "check", "command": ["uv", "run", "pytest", "-q", "tests/auth"], "depends_on": ["fix"],
+     "repair": {"task": "fix", "max_rounds": 2}}
+  ]
+}
+```
+
+## Failures and recovery
+
+Each attempt records why it failed: `declined`, `aborted`, `timeout`, `blocker`, `transient`,
+`invalid_output`, `read_only`, `check_failed`, `error` or `interrupted`.
+
+- `aborted` (stopped from outside, including session teardown) and `blocker` (authentication,
+  credit, model or delegation availability) stop new admissions for the run; running children
+  finish.
+- Only a `transient` failure of a child that ran no tool is retried automatically (twice at most).
+  Any other failure waits for the parent, because the child may have changed the workspace.
+- A write task fails before any spawn if its profile has no `edit`, `write` or `bash` tool under
+  the current grant, and fails as `read_only` if its child ran in `plan` mode.
+
+Snapshots (schema 2; schema 1 snapshots migrate) are written at plan changes, execution
+boundaries, dynamic steps and attempt completion. A small attempt record is written as soon as
+a child starts, and every child prompt starts with a `[aelix-workflow run=… task=… attempt=…]`
+marker that Aelix keeps in its own spawn receipt. After a crash or restart, started work is
+restored as interrupted with its child ID. A child that settled successfully is recovered from
+its own session file instead of being re-run; an unsettled child is reported with the tool calls
+its session file shows.
+
 ## Execution boundaries
 
-- 1–4 concurrent tasks, at most 64 graph nodes, 32 attempts per run, and 16 admissions per user
-  prompt shared across all workflows. Timeouts are 1–600 seconds per child.
+- 1–4 concurrent tasks, at most 64 tasks including fan-out items, 16 items per fan-out,
+  128 attempts per run, and 16 admissions per user prompt shared across all workflows.
+  Timeouts are 1–1,800 seconds per task. A child prompt is at most 60,000 UTF-8 bytes;
+  dependency evidence is cut at character boundaries to fit.
 - Every child uses the host's public consent-taking `SubagentRuntime.spawn` contract. Profiles
   resolve with `allow_project=False`; no private grants, subprocess launcher, or permission
   widening is introduced. The parent must have an active `agent` tool.
@@ -135,16 +203,21 @@ An agent's successful return is execution evidence; it does not prove all accept
   the built-in `agent` tool's per-prompt counter. This extension applies its own 16-admission
   counter and stores the task-to-child association in its workflow snapshots. Consent is taken
   per child by the host, rather than once for a whole workflow.
-- Failed tasks do not unblock their successors or retry themselves. Revisions invalidate
-  every dependent result while retaining prior attempt evidence.
-- Graph/attempt snapshots use `aelix-workflow.snapshot` session entries. Aelix queues these
-  writes; persistence follows the host's session flush behavior. `--no-session` is volatile.
-  Resume and fork use only the current session branch. Restored running tasks become interrupted
-  and need an explicit retry after checking possible side effects.
+- Failed tasks do not unblock their successors. Revisions, retried fan-outs and repairs
+  invalidate every dependent result while retaining prior attempt evidence and spend.
+- Graph snapshots use `aelix-workflow.snapshot` entries and attempt starts use
+  `aelix-workflow.attempt` entries. Aelix queues these writes; persistence follows the host's
+  session flush behavior. `--no-session` is volatile. Resume and fork use only the current
+  session branch. Restored running tasks become interrupted and need an explicit retry.
+- Check commands run with the user's own permissions after the user approves them; approval
+  covers that workflow only and is not persisted. Write tasks in the same workflow can change
+  the code a check executes, and the approval dialog names them. Headless sessions cannot
+  approve, so their checks decline.
 - Execution is foreground; live TUI updates continue while the tool is awaited. Background
   runs, generated-script execution, peer messaging, process resurrection, and isolated write
-  worktrees remain later work. Parallel children share the host working directory; assign
-  disjoint write ownership or use concurrency 1 for overlapping edits.
+  worktrees remain later work. Parallel children share the host working directory: tasks with
+  overlapping `writes`, writers without `writes`, and checks never run at the same time. In a
+  trusted project, a lock-free `git status` records changes outside a task's declared scope.
 
 ## Verification
 
@@ -165,7 +238,8 @@ CI pins the Aelix host revision; it does not test every host version in the depe
 Provider calls and interactive terminal sessions are separate, explicitly run checks.
 
 For the real-TUI transport simulation, start Aelix with `-e examples/tui_demo.py` and invoke
-`/workflow-demo`. This makes no model calls. For a small live check using a registered profile:
+`/workflow-demo`: a review fans out into three verifications, a write task runs, and a check
+fails once and is repaired. This makes no model calls and runs no commands. For a small live check using a registered profile:
 
 ```sh
 uv run python examples/live_smoke.py --profile general
@@ -174,5 +248,8 @@ uv run python examples/live_smoke.py --profile general
 Replace `general` with an existing user/global profile name. Optional `--provider` and `--model`
 arguments select a provider explicitly; otherwise the check uses your current Aelix default.
 
-See [the reference investigation](docs/references.md), [the design decision](docs/decisions/0001-adaptive-graph-and-host-delegation.md),
+See [the reference investigation](docs/references.md), the design decisions
+([graph and delegation](docs/decisions/0001-adaptive-graph-and-host-delegation.md),
+[activation modes](docs/decisions/0002-proactive-and-explicit-workflow-modes.md),
+[dynamic steps, failures and recovery](docs/decisions/0003-dynamic-steps-failure-semantics-and-recovery.md)),
 and [verification evidence](docs/verification.md).

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shlex
 import shutil
 import time
 from collections.abc import Callable
@@ -17,11 +19,14 @@ from aelix_coding_agent.extensions.api import ExtensionAPI, ExtensionContext, Ex
 from aelix_coding_agent.extensions.headless_ui import HEADLESS_UI_CONTEXT
 from aelix_coding_agent.subagent_contract import (
     MAX_SUBAGENT_DEPTH,
+    ResolvedProfile,
     SubagentProgress,
     SubagentResult,
     subagent_depth,
 )
+from aelix_coding_agent.tools import ALL_TOOL_NAMES
 
+from aelix_workflow import recovery, report
 from aelix_workflow.activation import (
     DEFAULT_MODE,
     MODE_ENTRY_TYPE,
@@ -29,34 +34,44 @@ from aelix_workflow.activation import (
     activation_guidance,
     requested_workflow,
 )
-from aelix_workflow.engine import WorkflowEngine
-from aelix_workflow.model import Task, Workflow, WorkflowError
+from aelix_workflow.engine import CheckOutcome, CheckRefused, WorkflowEngine
+from aelix_workflow.model import WRITE_TOOLS, Attempt, Task, Workflow, WorkflowError
 from aelix_workflow.panel import STATUS_KEY, WIDGET_KEY, render_details, render_panel, status_line
 from aelix_workflow.schema import PLAN_SCHEMA, RUN_SCHEMA, STATUS_SCHEMA
+from aelix_workflow.workspace import GitWorkspace
 
 SNAPSHOT_TYPE = "aelix-workflow.snapshot"
 PROMPT_DELEGATION_LIMIT = 16
+ALLOW_CHECKS = "Allow for this workflow"
 _LOG = logging.getLogger(__name__)
 _GUIDANCE = """
 Dynamic workflows are available through workflow_plan, workflow_run and workflow_status.
 When workflow activation permits it, decompose the goal into verifiable, self-contained tasks
 using existing agent profiles from the agent tool's roster. Create a dependency graph with
-workflow_plan(action='create'). Execute it with workflow_run(run_id=...). Independent tasks
-run in parallel, subject to the graph's max_concurrency and the host's permission checks.
-Read the actual results before deciding what to do next. Use add or revise to adapt the graph,
-and retry for a failed/interrupted task only after examining its failure and possible side effects.
-A declined delegation is the user's refusal: stop that branch and do not retry it.
+workflow_plan(action='create') and execute it with workflow_run(run_id=...). Independent tasks
+run in parallel, subject to max_concurrency, declared write scopes and the host's permission
+checks.
+Let the graph adapt without extra turns where you can: an output_schema gives a task structured
+data; for_each runs one child per item of such data (where filters items); when skips a task
+whose condition on a dependency result is false; kind='check' runs a command the user approves
+and passes on exit code 0; repair on a check reruns an upstream fix with the failure output.
+Mark tasks that must change files access='write' and list the files they own in writes.
+Overlapping writers never run together; a write task whose child had no write authority fails
+as read_only. Keep read-only investigations read.
+workflow_run reports only what finished in that run; read details with workflow_status(run_id,
+task_id). Use add or revise to adapt the graph, and retry a failed or interrupted task only
+after examining its failure and possible side effects.
+A declined delegation or command is the user's refusal: stop that branch and do not retry it.
 Authentication failures, credit/usage limits, unavailable models and unavailable delegation
-require a change outside the workflow. Do not retry unchanged calls or create another workflow
-to work around the same blocker. Use ordinary available tools when they can do the work and
-report the delegated checks as unverified.
-Revising a task invalidates dependent results. Include a verification task when the goal needs it.
-A task marked succeeded means its agent returned successfully, not that every acceptance check
-passed. Inspect failed checks reported in its summary; add corrective work when needed.
-Call finish with an evidence-based summary only after the goal is achieved. Do not silently skip
+halt the run and require a change outside the workflow. Do not retry unchanged calls or create
+another workflow to work around the same blocker. Use ordinary available tools when they can do
+the work and report the delegated checks as unverified.
+Revising a task invalidates dependent results. A task marked succeeded means its agent returned
+successfully, not that every acceptance check passed; prefer check tasks for acceptance. Call
+finish with an evidence-based summary only after the goal is achieved. Do not silently skip
 failed work. No workflow or child may increase the parent's tool grant or approve an action for
 the user. Workflows require the host's --agents feature and an active agent tool. Execution is
-foreground in this version; the TUI progress panel remains visible and updates as agents work.
+foreground: the TUI panel updates while agents work, and Ctrl+C pauses the run.
 """.strip()
 
 
@@ -82,6 +97,11 @@ class WorkflowExtension:
         self._last_render = 0.0
         self._last_signature: Any = None
         self._restore_warning: str | None = None
+        self._cwd: str | None = None
+        self._project_trusted = False
+        # Verification commands the user answered, per workflow run; never persisted.
+        self._approved: set[tuple[str, tuple[str, ...]]] = set()
+        self._denied: set[tuple[str, tuple[str, ...]]] = set()
 
     def install(self) -> None:
         for name, description, schema, execute in (
@@ -89,7 +109,9 @@ class WorkflowExtension:
                 "workflow_plan",
                 "Create or adapt a workflow task graph. create needs goal/tasks; add/revise need "
                 "run_id/tasks/reason; retry/skip need run_id/task_ids/reason; finish needs "
-                "run_id/summary. Changes are atomic; cycles and unknown dependencies are rejected. "
+                "run_id/summary. Tasks delegate to agent profiles or run approved check "
+                "commands; output_schema, for_each, when and repair let the graph expand from "
+                "results. Changes are atomic; cycles and unknown dependencies are rejected. "
                 "In workflow mode off, mutations require an explicit current workflow request.",
                 PLAN_SCHEMA,
                 self.plan,
@@ -97,17 +119,20 @@ class WorkflowExtension:
             (
                 "workflow_run",
                 "Execute ready workflow tasks through Aelix's consent-taking delegation runtime. "
-                "Independent tasks run concurrently and successors receive dependency summaries. "
-                "Returns execution evidence for replanning; failed work is never retried automatically. "
-                "Requires --agents. This foreground call updates the TUI throughout execution. "
+                "Independent tasks run concurrently, successors receive dependency results, and "
+                "for_each/when/repair steps happen without another turn. The report lists only "
+                "what finished in this run. Failed work is not retried automatically, except "
+                "transient failures of children that ran no tool. Requires --agents. This "
+                "foreground call updates the TUI throughout execution; Ctrl+C pauses it. "
                 "In workflow mode off, execution requires an explicit current workflow request.",
                 RUN_SCHEMA,
                 self.run,
             ),
             (
                 "workflow_status",
-                "Inspect workflow tasks, attempts, outputs, dependency waits and revision history. "
-                "With no run_id, inspect the most recently selected workflow.",
+                "Inspect workflow tasks, dependency waits and revision history, or one task's "
+                "attempts, result data and tool trail with task_id. With no run_id, inspect the "
+                "most recently selected workflow.",
                 STATUS_SCHEMA,
                 self.status,
             ),
@@ -126,7 +151,7 @@ class WorkflowExtension:
         self.api.register_command(
             "workflow",
             handler=self.command,
-            description="Run/inspect a workflow or set /workflow mode on|off",
+            description="Run/inspect/continue a workflow or set /workflow mode on|off",
         )
         self.api.on("session_start", self.session_start)
         self.api.on("before_agent_start", self.before_agent_start)
@@ -200,11 +225,19 @@ class WorkflowExtension:
         if persist:
             # The host queues these records and drains them with its session lifecycle.
             # ToolResult.details alone is deliberately not used as durable storage.
-            try:
-                self.api.append_entry(SNAPSHOT_TYPE, run.to_dict())
-            except ExtensionError:
-                _LOG.debug("Workflow snapshot reached a disposed runtime", exc_info=True)
+            self._append(SNAPSHOT_TYPE, run.to_dict())
         self._render(force=persist)
+
+    def _append(self, custom_type: str, data: Any) -> None:
+        try:
+            self.api.append_entry(custom_type, data)
+        except ExtensionError:
+            _LOG.debug("Workflow record reached a disposed runtime", exc_info=True)
+
+    def _started(self, run: Workflow, task: Task, attempt: Attempt) -> None:
+        # A full snapshot follows at completion; this small record exists so a crash in
+        # between still knows which child the attempt belonged to.
+        self._append(recovery.ATTEMPT_TYPE, recovery.attempt_record(run, task, attempt))
 
     def _render(self, *, force: bool = True) -> None:
         now = time.monotonic()
@@ -214,7 +247,7 @@ class WorkflowExtension:
                 self.mode,
                 selected.id,
                 selected.state,
-                [(t.state, t.current_tool) for t in selected.tasks.values()],
+                [(t.state, t.current_tool) for t in selected.iter_all()],
             )
             if selected is not None
             else self.mode
@@ -247,6 +280,31 @@ class WorkflowExtension:
             # A disappearing/broken TUI must never change the outcome of delegated work.
             _LOG.debug("Workflow UI update failed", exc_info=True)
 
+    def _resolve(self, name: str) -> ResolvedProfile:
+        runtime = self.api.runtime.subagents
+        if runtime is None:
+            raise WorkflowError(
+                "Delegation is unavailable. Start Aelix with --agents and an active agent tool."
+            )
+        # Model-originated tasks never use the human command's project-identity override.
+        return runtime.resolve_profile(name, allow_project=False)
+
+    def _check_profiles(self, tasks: Any) -> None:
+        """Refuse an unknown profile while the plan is written, not after work started."""
+        if self.api.runtime.subagents is None or not isinstance(tasks, list):
+            return
+        for task in tasks:
+            if not isinstance(task, dict) or task.get("kind", "agent") not in {"agent", None}:
+                continue
+            name = task.get("profile")
+            if isinstance(name, str) and name.strip():
+                try:
+                    self._resolve(name.strip())
+                except Exception as exc:
+                    raise WorkflowError(
+                        f"Task {task.get('id')}: profile {name!r} is not available: {exc}"
+                    ) from None
+
     async def plan(self, args: dict[str, Any], _context: ToolExecutionContext) -> ToolResult:
         try:
             self._require_activation()
@@ -267,8 +325,10 @@ class WorkflowExtension:
                 raise WorkflowError(f"Fields not supported by {action}: {sorted(extra)}")
             if action != "create" and not isinstance(args.get("run_id"), str):
                 raise WorkflowError(f"{action} requires an explicit run_id.")
+            if action in {"create", "add", "revise"}:
+                self._check_profiles(args.get("tasks"))
             if action == "create":
-                if any(r.state == "running" for r in self.runs.values()):
+                if self.engine.active:
                     raise WorkflowError("Wait for the active workflow before creating another.")
                 run = Workflow.create(
                     args.get("goal"), args.get("tasks"), args.get("max_concurrency", 2)
@@ -288,7 +348,7 @@ class WorkflowExtension:
                 elif action == "finish":
                     run.finish(args.get("summary"))
                 elif action == "cancel":
-                    if any(t.state == "running" for t in run.tasks.values()):
+                    if any(t.state == "running" for t in run.units()):
                         raise WorkflowError(
                             "Interrupt the active execution before cancelling its graph."
                         )
@@ -296,7 +356,7 @@ class WorkflowExtension:
                 else:
                     raise WorkflowError(f"Unknown workflow action: {action}")
             self._changed(True)
-            return _result(render_details(run), data=run.to_dict())
+            return _result(report.overview(run), data=run.to_dict())
         except (WorkflowError, ValueError) as exc:
             return _result(str(exc), error=True)
 
@@ -306,24 +366,105 @@ class WorkflowExtension:
         self.remaining -= 1
         return True
 
+    def _write_capable(self, resolved: ResolvedProfile) -> bool:
+        grant = set(self.api.get_active_tools())
+        tools = resolved.profile.tools
+        requested = set(tools) if tools is not None else grant
+        return bool(requested & grant & set(ALL_TOOL_NAMES) & WRITE_TOOLS)
+
+    async def _approve_checks(self, run: Workflow) -> None:
+        """Ask once per run, before any child starts, so no dialog competes with spawn consent."""
+        commands = [
+            t.spec.command for t in run.units() if t.spec.kind == "check" and t.state == "pending"
+        ]
+        unknown = [
+            c
+            for c in dict.fromkeys(commands)
+            if (run.id, c) not in self._approved and (run.id, c) not in self._denied
+        ]
+        ui = self.api.runtime.ui
+        if not unknown or ui is HEADLESS_UI_CONTEXT:
+            return
+        listing = "\n".join(f"  $ {shlex.join(command)}" for command in unknown)
+        writers = sorted(t.id for t in run.units() if t.spec.access == "write")
+        warning = (
+            f"Write tasks in this workflow ({', '.join(writers[:6])}) can change the code these "
+            "commands execute, and later rounds run it without asking again."
+            if writers
+            else "Later rounds of this workflow run them again without asking."
+        )
+        title = (
+            f"Workflow {run.id} asks to run {len(unknown)} verification command(s) in "
+            f"{self._cwd_now()}:\n{listing}\n"
+            f"They run without a shell, with your own permissions. {warning}"
+        )
+        try:
+            answer = await ui.select(title, [ALLOW_CHECKS, "Deny"])
+        except Exception:
+            answer = None
+        target = self._approved if answer == ALLOW_CHECKS else self._denied
+        target.update((run.id, command) for command in unknown)
+
+    async def _check(self, run: Workflow, task: Task) -> CheckOutcome:
+        command = task.spec.command
+        if (run.id, command) not in self._approved:
+            raise CheckRefused(
+                "The user declined this verification command."
+                if (run.id, command) in self._denied
+                else "Verification commands need the user's approval in the interactive TUI."
+            )
+        started = time.monotonic()
+        result = await self.api.exec(
+            command[0], list(command[1:]), cwd=self._cwd_now(), timeout_ms=task.spec.timeout_ms
+        )
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part.strip())
+        return CheckOutcome(
+            exit_code=result.code,
+            output=output[-20_000:],
+            elapsed_ms=int((time.monotonic() - started) * 1_000),
+            timed_out=result.killed,
+        )
+
+    def _cwd_now(self) -> str:
+        return self._cwd or os.getcwd()
+
     async def run(self, args: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
         try:
             self._require_activation()
-            if not isinstance(args.get("run_id"), str) or set(args) - {"run_id"}:
-                raise WorkflowError("workflow_run requires run_id and accepts no other fields.")
+            if not isinstance(args.get("run_id"), str) or set(args) - {
+                "run_id",
+                "stop_on_failure",
+            }:
+                raise WorkflowError(
+                    "workflow_run requires run_id and accepts only stop_on_failure besides it."
+                )
+            stop_on_failure = args.get("stop_on_failure") or False
+            if not isinstance(stop_on_failure, bool):
+                raise WorkflowError("stop_on_failure must be true or false.")
             run = self._get(args.get("run_id"))
-            runtime = self.api.runtime.subagents
-            if runtime is None or "agent" not in self.api.get_active_tools():
+            if self.engine.active:
+                raise WorkflowError("A workflow execution is already active in this session.")
+            # Every identity this execution can need is resolved before any work starts,
+            # including the targets that a check's repair may rerun.
+            upcoming = [t for t in run.units() if t.state == "pending"]
+            for check in [t for t in upcoming if t.spec.repair]:
+                upcoming.append(run.tasks[check.spec.repair["task"]])  # type: ignore[index]
+            agents = [t for t in upcoming if t.spec.kind == "agent"]
+            if agents and "agent" not in self.api.get_active_tools():
                 raise WorkflowError(
                     "Delegation is unavailable. Start Aelix with --agents and an active agent tool."
                 )
-            # Resolve every pending identity before starting any work. Model-originated
-            # tasks never use the human command's project-identity override.
-            profiles = {
-                task.spec.id: runtime.resolve_profile(task.spec.profile, allow_project=False)
-                for task in run.tasks.values()
-                if task.state == "pending"
-            }
+            profiles = {name: self._resolve(name) for name in {t.spec.profile for t in agents}}
+            for task in agents:
+                if task.spec.access == "write" and not self._write_capable(
+                    profiles[task.spec.profile]
+                ):
+                    raise WorkflowError(
+                        f"Task {task.id} must change files, but profile {task.spec.profile!r} "
+                        "has no edit, write or bash tool under the current tool grant. Revise "
+                        "the task's profile or ask the user to grant those tools."
+                    )
+            await self._approve_checks(run)
 
             async def delegate(
                 task: Task, prompt: str, on_event: Callable[[SubagentProgress], None]
@@ -332,28 +473,30 @@ class WorkflowExtension:
                 # No private spawn_granted API, forged grant, or new process launcher.
                 # This public door does not charge the host agent-tool budget, so this
                 # extension enforces a separate, shared 16-per-user-prompt admission cap.
-                return await runtime.spawn(
-                    profiles[task.spec.id],
-                    prompt,
-                    timeout_ms=task.spec.timeout_ms,
-                    on_event=on_event,
+                resolved = profiles.get(task.spec.profile) or self._resolve(task.spec.profile)
+                return await self.api.runtime.subagents.spawn(  # type: ignore[union-attr]
+                    resolved, prompt, timeout_ms=task.spec.timeout_ms, on_event=on_event
                 )
 
-            await self.engine.execute(
+            execution = await self.engine.execute(
                 run,
                 delegate,
                 changed=lambda persist: self._changed(persist, run),
                 admit=self._admit,
                 signal=context.signal,
+                check=lambda task: self._check(run, task),
+                started=lambda task, attempt: self._started(run, task, attempt),
+                # git status can run filters named by the repository's own configuration.
+                workspace=GitWorkspace(self.api, self._cwd_now())
+                if self._project_trusted
+                else None,
+                stop_on_failure=stop_on_failure,
             )
-            text = render_details(run)
-            text += (
-                "\n\nInspect the results. Add/revise tasks for new findings, explicitly retry failures, "
-                "or finish with a verified summary. Agent success alone is not acceptance verification."
-            )
-            if run.state == "needs_attention" and self.remaining <= 0:
+            text = f"{report.run_report(run, execution)}\n{report.NEXT_STEPS}"
+            if execution.halted and self.remaining <= 0:
                 text += (
-                    "\nThe per-prompt delegation budget is exhausted. Continue in a new user turn."
+                    "\nThe per-prompt delegation budget is exhausted. Continue in a new user "
+                    "turn; the user can type /workflow continue."
                 )
             return _result(text, data=run.to_dict(), error=run.state == "needs_attention")
         except asyncio.CancelledError:
@@ -363,18 +506,33 @@ class WorkflowExtension:
 
     async def status(self, args: dict[str, Any], _context: ToolExecutionContext) -> ToolResult:
         try:
-            if set(args) - {"run_id"}:
-                raise WorkflowError("workflow_status accepts only run_id.")
+            if set(args) - {"run_id", "task_id"}:
+                raise WorkflowError("workflow_status accepts only run_id and task_id.")
             if not self.runs and args.get("run_id") is None:
                 return _result(f"{self._mode_status()}\nNo workflow yet.", data={"mode": self.mode})
             run = self._get(args.get("run_id"))
             self._render()
-            text = f"{self._mode_status()}\n{render_details(run)}"
+            task_id = args.get("task_id")
+            body = (
+                report.overview(run)
+                if task_id is None
+                else report.task_detail(run, run.find(task_id))
+            )
+            text = f"{self._mode_status()}\n{body}"
             if self._restore_warning:
                 text = f"{self._restore_warning}\n\n{text}"
             return _result(text, data=run.to_dict())
         except WorkflowError as exc:
             return _result(str(exc), error=True)
+
+    def _send(self, text: str, ctx: ExtensionContext | None) -> None:
+        message = UserMessage(content=[TextContent(text=text)])
+        if ctx is not None and not ctx.is_idle():
+            self.api.send_message(message, deliver_as="follow_up")
+        else:
+            # send_user_message queues at idle. send_message's explicit trigger
+            # starts a managed host turn without also enqueuing it a second time.
+            self.api.send_message(message, trigger_turn=True)
 
     async def command(self, args: str, _ctx: ExtensionContext) -> str:
         args = args.strip()
@@ -400,32 +558,40 @@ class WorkflowExtension:
             self.visible = args == "show"
             self._render()
             return f"Workflow panel {args}."
-        if not args or args == "status" or args.startswith("status "):
+        if not args or words[0] == "status":
             if not self.runs:
                 return (
                     self._restore_warning
                     or f"{self._mode_status()}\nNo workflow yet. Use /workflow <goal>."
                 )
-            target = args.removeprefix("status ") if args.startswith("status ") else None
+            parts = args.split()[1:]
             try:
-                return f"{self._mode_status()}\n{render_details(self._get(target))}"
+                run = self._get(parts[0] if parts else None)
+                if len(parts) > 1:
+                    return report.task_detail(run, run.find(parts[1]))
+                return f"{self._mode_status()}\n{render_details(run)}"
             except WorkflowError as exc:
                 return str(exc)
-        message = UserMessage(
-            content=[
-                TextContent(
-                    text=f"Workflow: {args}\n\nCreate and execute an adaptive workflow for this goal. "
-                    "Use workflow_plan, workflow_run and workflow_status. Replan from actual results, "
-                    "verify the result, then finish the workflow."
-                )
-            ]
+        parts = args.split()[1:]
+        if words[0] == "continue" and (not parts or (len(parts) == 1 and parts[0] in self.runs)):
+            # "/workflow continue the refactor" is a goal, not a run to resume.
+            target = parts[0] if parts else self.selected
+            if target is None or target not in self.runs:
+                return "No workflow to continue. Use /workflow <goal> to start one."
+            self._send(
+                f"Workflow: continue run {target}.\n\nInspect it with workflow_status, then "
+                f"resume it with workflow_run(run_id='{target}'). Retry interrupted or failed work "
+                "only after checking its cause and side effects. Replan from the results, verify "
+                "the result, then finish the workflow.",
+                _ctx,
+            )
+            return f"Continuing workflow {target}."
+        self._send(
+            f"Workflow: {args}\n\nCreate and execute an adaptive workflow for this goal. "
+            "Use workflow_plan, workflow_run and workflow_status. Replan from actual results, "
+            "verify the result, then finish the workflow.",
+            _ctx,
         )
-        if _ctx is not None and not _ctx.is_idle():
-            self.api.send_message(message, deliver_as="follow_up")
-        else:
-            # send_user_message queues at idle. send_message's explicit trigger
-            # starts a managed host turn without also enqueuing it a second time.
-            self.api.send_message(message, trigger_turn=True)
         return "Workflow requested. Progress will appear above the editor."
 
     async def before_agent_start(
@@ -435,6 +601,7 @@ class WorkflowExtension:
         active_mode: WorkflowMode = self.mode
         self._turn_mode = active_mode
         self._request_context = _ctx
+        self._capture_cwd(_ctx)
         self._turn_allowed = self.mode == "on" or requested_workflow(getattr(event, "prompt", ""))
         self._render()
         if not {"workflow_plan", "workflow_run"}.issubset(self.api.get_active_tools()):
@@ -442,9 +609,20 @@ class WorkflowExtension:
         policy = activation_guidance(active_mode, allowed=self._turn_allowed)
         if "agent" not in self.api.get_active_tools():
             policy += "\nDelegation is unavailable in this session. Do not create or run workflows; handle work directly."
-        return BeforeAgentStartResult(
-            system_prompt=f"{event.system_prompt}\n\n{policy}\n\n{_GUIDANCE}"
-        )
+        # A request that may not use workflows does not pay for the usage guide.
+        guide = f"\n\n{_GUIDANCE}" if self._turn_allowed else ""
+        return BeforeAgentStartResult(system_prompt=f"{event.system_prompt}\n\n{policy}{guide}")
+
+    def _capture_cwd(self, ctx: Any) -> None:
+        try:
+            cwd = getattr(ctx, "cwd", None) if ctx is not None else None
+            trusted = getattr(ctx, "is_project_trusted", None) if ctx is not None else None
+            self._project_trusted = bool(trusted()) if callable(trusted) else False
+        except ExtensionError:
+            cwd = None
+            self._project_trusted = False
+        if isinstance(cwd, str) and cwd:
+            self._cwd = cwd
 
     async def session_start(self, _event: Any, ctx: ExtensionContext) -> None:
         self.runs.clear()
@@ -454,11 +632,17 @@ class WorkflowExtension:
         self._turn_allowed = None
         self._turn_mode = None
         self._request_context = None
+        self._approved.clear()
+        self._denied.clear()
+        self._capture_cwd(ctx)
         try:
             session = ctx.session_manager.get_session()
             entries = await session.get_branch() if session is not None else []
-            for entry in entries:
-                if getattr(entry, "custom_type", None) == MODE_ENTRY_TYPE:
+            latest: dict[str, tuple[int, Any]] = {}
+            records: list[tuple[int, Any]] = []
+            for index, entry in enumerate(entries):
+                custom_type = getattr(entry, "custom_type", None)
+                if custom_type == MODE_ENTRY_TYPE:
                     data = entry.data
                     if (
                         isinstance(data, dict)
@@ -472,24 +656,37 @@ class WorkflowExtension:
                     else:
                         self.mode = "off"
                         self._restore_warning = "Could not restore workflow mode; using off."
-                    continue
-                if getattr(entry, "custom_type", None) != SNAPSHOT_TYPE:
-                    continue
+                elif custom_type == SNAPSHOT_TYPE:
+                    run_id = entry.data.get("id") if isinstance(entry.data, dict) else None
+                    if isinstance(run_id, str):
+                        latest[run_id] = (index, entry.data)
+                    else:
+                        self._restore_warning = "Could not restore a workflow snapshot: no id"
+                elif custom_type == recovery.ATTEMPT_TYPE:
+                    records.append((index, entry.data))
+            receipts = recovery.collect_receipts(entries)
+            parent_path = getattr(session, "session_file", None)
+            # Only each run's latest snapshot counts: an invalid latest snapshot must not
+            # resurrect an older, more successful-looking state.
+            for index, data in sorted(latest.values(), key=lambda item: item[0]):
                 try:
-                    run = Workflow.restore(entry.data)
-                except (WorkflowError, TypeError, KeyError) as exc:
+                    run = Workflow.restore(data)
+                except (WorkflowError, TypeError, KeyError, ValueError) as exc:
                     self._restore_warning = f"Could not restore a workflow snapshot: {exc}"
                     _LOG.warning(self._restore_warning)
-                    # Do not present an older successful snapshot as the latest state.
-                    if isinstance(entry.data, dict):
-                        bad_id = entry.data.get("id")
-                        if isinstance(bad_id, str):
-                            self.runs.pop(bad_id, None)
-                            if self.selected == bad_id:
-                                self.selected = next(reversed(self.runs), None)
                     continue
+                touched = False
+                for record_index, record in records:
+                    if record_index > index:
+                        touched = recovery.apply_attempt_record(run, record) or touched
+                if touched:
+                    run.sync()
+                    run.refresh_state()
                 self.runs[run.id] = run
                 self.selected = run.id
+                notes = await recovery.reconcile(run, receipts, parent_path)
+                if touched or notes:
+                    self._append(SNAPSHOT_TYPE, run.to_dict())
         except Exception:
             _LOG.debug("Workflow session records unavailable", exc_info=True)
         self._render()
