@@ -107,7 +107,8 @@ final guarantee. `workflow_run` reports only attempts that finished in that call
 ### Persistence and recovery
 
 Snapshots are schema version 2 and version 1 snapshots migrate. Within a version the field set
-is strict; any future field bumps the version with a migration. Full snapshots are written at
+is strict; any future field bumps the version with a migration. Version 2 ships in package
+0.2.0; 0.1.0 refuses it as unsupported, so a downgrade does not restore runs saved by 0.2.0. Full snapshots are written at
 plan changes, execution start and end, dynamic steps and attempt completion — not at admission.
 When a child ID is first known, a small `aelix-workflow.attempt` record is appended, and every
 child prompt starts with `[aelix-workflow run=… task=… attempt=…]`.

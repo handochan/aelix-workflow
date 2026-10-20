@@ -98,7 +98,7 @@ For an installed Aelix environment, install the wheel into **the same environmen
 
 ```sh
 uv build
-uv pip install --python /path/to/aelix-environment/bin/python dist/aelix_workflow-0.1.0-py3-none-any.whl
+uv pip install --python /path/to/aelix-environment/bin/python dist/aelix_workflow-0.2.0-py3-none-any.whl
 aelix extension verify aelix-workflow
 ```
 

@@ -1,7 +1,7 @@
 [plugin]
 id = "aelix-workflow"
 name = "Aelix Workflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Adaptive orchestration with live workflow progress and session evidence"
 authors = ["handochan"]
 repository = "https://github.com/handochan/aelix-workflow"

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aelix-workflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Adaptive task orchestration with live workflow progress for Aelix"
 readme = "README.md"
 requires-python = ">=3.11"
