@@ -7,7 +7,7 @@ Date: 2026-11-21
 ## Problem
 
 Version 0.2.0 was built against Aelix `28dbcaf4`. At `83714045` the host had changed beneath it,
-and each of the following was reproduced or read from the host's code. This version targets
+and each of the following was reproduced or read from the host's code. Version 0.3.0 targets
 Aelix at `83714045` or later. On the released beta.2 it is best effort and not covered by the
 tests; the host's version string is still `0.1.0b2`, so the dependency floor cannot say so yet.
 

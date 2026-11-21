@@ -13,7 +13,7 @@ can add new investigations, revise invalid assumptions, retry interrupted work, 
 
 ## Develop and run
 
-This version targets Aelix at `83714045` or later. On the released beta.2 it is best effort and
+Version 0.3.0 targets Aelix at `83714045` or later. On the released beta.2 it is best effort and
 not covered by the tests; the host's version string is still `0.1.0b2`, so the dependency floor
 cannot say so yet.
 
@@ -131,7 +131,7 @@ For an installed Aelix environment, install the wheel into **the same environmen
 
 ```sh
 uv build
-uv pip install --python /path/to/aelix-environment/bin/python dist/aelix_workflow-0.2.0-py3-none-any.whl
+uv pip install --python /path/to/aelix-environment/bin/python dist/aelix_workflow-0.3.0-py3-none-any.whl
 aelix extension verify aelix-workflow
 ```
 

@@ -23,7 +23,7 @@ def test_built_wheel_contains_bound_manifest_and_entry_point(tmp_path):
     with zipfile.ZipFile(wheel) as archive:
         manifest = parse_manifest_toml(archive.read("aelix_workflow/aelix-plugin.toml").decode())
         assert manifest.plugin.id == "aelix-workflow"
-        assert manifest.plugin.version == "0.2.0"
+        assert manifest.plugin.version == "0.3.0"
         assert manifest.entry.python == "aelix_workflow:setup"
         endpoints = next(name for name in archive.namelist() if name.endswith("entry_points.txt"))
         assert "aelix-workflow = aelix_workflow:setup" in archive.read(endpoints).decode()
