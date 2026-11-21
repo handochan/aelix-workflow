@@ -512,6 +512,20 @@ def test_a_backslash_is_part_of_a_posix_name_not_a_separator():
     assert project_path("~/x.py") is None and project_path("/abs/x.py") is None
 
 
+def test_a_rooted_path_is_outside_even_where_the_platform_calls_it_relative(monkeypatch):
+    # CPython 3.13 on Windows: os.path.isabs("/abs/x.py") is False (rooted, no drive). The
+    # Windows 3.13 job of CI found it; this holds the same on every platform.
+    from aelix_workflow import workspace
+    from aelix_workflow.engine import reported_violations
+    from aelix_workflow.model import TaskSpec
+
+    monkeypatch.setattr(workspace.os.path, "isabs", lambda _path: False)
+    assert workspace.project_path("/abs/x.py") is None
+    assert workspace.project_path("src/x.py") == "src/x.py"
+    owner = TaskSpec.parse({**spec("t"), "writes": ["**/*.py"]})
+    assert reported_violations(owner, Attempt(1, changed_files=["/abs/x.py"])) == ["/abs/x.py"]
+
+
 # --- /workflow pause: a cooperative pause that returns normally ------------------------------
 
 

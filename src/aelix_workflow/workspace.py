@@ -72,13 +72,15 @@ def project_path(path: str) -> str | None:
     platform, one that climbed out as ``../…``, and an absolute or ``~`` one as the child
     wrote it (``runtime._display_path``). A backslash is part of a POSIX name, so it stays.
     The host runs in this process, so this platform's ``os.path`` reads its absolute paths.
+    A path inside is never rooted, so a leading separator is asked about by itself: on
+    Windows, CPython 3.13 stopped calling a rooted path without a drive absolute.
     """
     local = path
     while local.startswith("./"):
         local = local[2:]
     if (
         not local
-        or local.startswith("~")
+        or local.startswith(("~", "/", os.sep))
         or os.path.isabs(local)
         or os.path.splitdrive(local)[0]
         or ".." in local.split("/")

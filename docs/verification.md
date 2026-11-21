@@ -403,8 +403,13 @@ pytest 9.1.1, Ruff 0.16.10, Pyright 1.1.414.
 host-compatibility step, 295 after the host-signal step, 307 after the first review's fixes, 311
 with `/workflow pause`, 323 after the second review's fixes, 329 after the third review's, then
 the final pass's gap). `ruff check`, `ruff format --check` and `pyright` (with the project
-interpreter): clean. The same steps on CPython 3.11 are recorded under the third review pass;
-the GitHub Actions matrix was not re-run for this change.
+interpreter): clean. The same steps on CPython 3.11 are recorded under the third review pass.
+
+The GitHub Actions matrix first ran on pull request #2. Eight of nine jobs passed; Windows on
+CPython 3.13 failed one test. There `os.path.isabs("/abs/x.py")` is false, since 3.13 no longer
+calls a rooted path without a drive absolute, so `project_path` took such a path for one inside
+the project. It now reads a leading separator as outside by itself. A test holds that on every
+platform by making `isabs` answer false, and fails with the fix removed: **332 passed**.
 
 The host bench now also runs with background jobs on, the host's default: a real `JobService`
 installed through the host's activation seam, its `JobsExtension` registered first and bound to
