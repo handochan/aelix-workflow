@@ -52,7 +52,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: handochan/aelix-ai
-          ref: 28dbcaf4a1a9a97e46d88cec4b90c1ddeb486321
+          ref: 83714045439478b17ab0c61248dc5c414435927a
           path: aelix-ai
 
       - name: Set up uv and Python

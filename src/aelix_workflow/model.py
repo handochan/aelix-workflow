@@ -22,7 +22,7 @@ TaskState = Literal["pending", "running", "succeeded", "failed", "interrupted", 
 RunState = Literal[
     "ready", "running", "needs_attention", "awaiting_review", "completed", "cancelled"
 ]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # 3: what the host reports of a child, and wrapped_up (0.2.0 reads 2)
 MAX_TASKS = 64
 MAX_ATTEMPTS = 128
 MAX_ITEMS = 16
@@ -34,6 +34,9 @@ SUMMARY_LIMIT = 4_000
 TRAIL_LIMIT = 4_096
 MAX_DATA_BYTES = 16_000
 REPAIR_CONTEXT_LIMIT = 4_000
+MAX_FILES = 64  # The host keeps at most this many written paths per child, then counts.
+PATH_LIMIT = 1_000
+REASON_LIMIT = 500
 TASK_STATES = frozenset({"pending", "running", "succeeded", "failed", "interrupted", "skipped"})
 RUN_STATES = frozenset(
     {"ready", "running", "needs_attention", "awaiting_review", "completed", "cancelled"}
@@ -184,7 +187,7 @@ class TaskSpec:
     profile: str = ""
     depends_on: tuple[str, ...] = ()
     phase: str = "Work"
-    timeout_ms: int | None = None
+    timeout_ms: int | None = None  # Checks only; a delegated agent has no time limit.
     kind: str = "agent"
     access: str = "read"
     writes: tuple[str, ...] = ()
@@ -221,12 +224,6 @@ class TaskSpec:
             "title": text_field(raw.get("title"), "task.title", limit=300),
             "depends_on": tuple(deps),
             "phase": text_field(raw.get("phase", "Work"), "task.phase", limit=100),
-            # Unset leaves an agent's limit to its profile (Aelix: 600 s), as the agent tool does.
-            "timeout_ms": (
-                integer(raw["timeout_ms"], "timeout_ms", 1_000, MAX_TIMEOUT_MS)
-                if "timeout_ms" in raw
-                else None
-            ),
             "kind": kind,
         }
         when = raw.get("when")
@@ -252,9 +249,24 @@ class TaskSpec:
                 **common,
                 command=_command(raw.get("command"), where),
                 repair=_repair(repair, where) if repair is not None else None,
+                timeout_ms=(
+                    integer(raw["timeout_ms"], "timeout_ms", 1_000, MAX_TIMEOUT_MS)
+                    if "timeout_ms" in raw
+                    else None
+                ),
             )
         if raw.keys() & {"command", "repair"}:
             raise WorkflowError(f"{where}: command and repair belong to check tasks.")
+        if "timeout_ms" in raw:
+            # A model's kill timer cuts working children short; current Aelix ignores one
+            # (its ADR-0276), and an older one takes the limit from the profile instead.
+            raise WorkflowError(
+                f"{where}: timeout_ms applies to check tasks only; a workflow sets no time "
+                "limit for a delegated agent. Current Aelix has none: the agent runs until it "
+                "finishes or the user stops it (Ctrl+C or /workflow pause). An older Aelix "
+                "ends it at its profile's own limit (600 s by default), which only the profile "
+                "can raise. Leave timeout_ms out."
+            )
         writes = _writes(raw.get("writes", []), where)
         access = raw.get("access", "write" if writes else "read")
         if access not in {"read", "write"}:
@@ -317,14 +329,37 @@ class Attempt:
     data: Any = None
     exit_code: int | None = None
     scope_violations: list[str] = field(default_factory=list)
+    # What the host reports a child did (absent on older hosts); written only when set.
+    session_id: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    unconfirmed_files: list[str] = field(default_factory=list)
+    files_overflow: int = 0
+    reason: str | None = None
+    # How many scope_violations, from the front, are the child's own reported writes; the
+    # rest git saw, where concurrent writers share the blame.
+    own_violations: int = 0
+
+    @property
+    def own_scope(self) -> list[str]:
+        return self.scope_violations[: self.own_violations]
+
+    @property
+    def observed_scope(self) -> list[str]:
+        return self.scope_violations[self.own_violations :]
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        data = dataclasses.asdict(self)
+        # An attempt with nothing new reads exactly as one written before these fields.
+        for key in _ATTEMPT_OPTIONAL:
+            if data[key] == _ATTEMPT_OPTIONAL[key]:
+                del data[key]
+        return data
 
     @classmethod
     def restore(cls, raw: Any, number: int) -> Attempt:
-        if not isinstance(raw, dict) or set(raw) != _ATTEMPT_FIELDS:
+        if not isinstance(raw, dict) or not _ATTEMPT_REQUIRED <= set(raw) <= _ATTEMPT_FIELDS:
             raise WorkflowError("Invalid attempt record fields.")
+        raw = {**copy.deepcopy(_ATTEMPT_OPTIONAL), **raw}
         if raw["number"] != number or isinstance(raw["number"], bool):
             raise WorkflowError("Attempt numbers must be sequential.")
         if raw["status"] not in ATTEMPT_STATUSES:
@@ -342,23 +377,31 @@ class Attempt:
             ("model", 300),
             ("permission_mode", 40),
             ("tool_trail", TRAIL_LIMIT),
+            ("session_id", 200),
+            ("reason", REASON_LIMIT),
         ):
             value = raw[key]
             if value is not None and (not isinstance(value, str) or len(value) > limit):
                 raise WorkflowError(f"Invalid attempt {key}.")
-        for key in ("elapsed_ms", "input_tokens", "output_tokens"):
+        for key in ("elapsed_ms", "input_tokens", "output_tokens", "files_overflow"):
             integer(raw[key], key, 0, 1_000_000_000_000)
         cost = raw["cost"]
         if isinstance(cost, bool) or not isinstance(cost, int | float) or not math.isfinite(cost):
             raise WorkflowError("Invalid attempt cost.")
         if cost < 0:
             raise WorkflowError("Invalid attempt cost.")
-        for key, limit in (("dropped_tools", 32), ("scope_violations", 20)):
+        for key, limit, size in (
+            ("dropped_tools", 32, 400),
+            ("scope_violations", 20, PATH_LIMIT),
+            ("changed_files", MAX_FILES, PATH_LIMIT),
+            ("unconfirmed_files", MAX_FILES, PATH_LIMIT),
+        ):
             value = raw[key]
             if not isinstance(value, list) or len(value) > limit:
                 raise WorkflowError(f"Invalid attempt {key}.")
-            if any(not isinstance(v, str) or len(v) > 400 for v in value):
+            if any(not isinstance(v, str) or len(v) > size for v in value):
                 raise WorkflowError(f"Invalid attempt {key}.")
+        integer(raw["own_violations"], "own_violations", 0, len(raw["scope_violations"]))
         if not isinstance(raw["truncated"], bool):
             raise WorkflowError("Invalid attempt truncation flag.")
         if raw["exit_code"] is not None:
@@ -369,6 +412,15 @@ class Attempt:
 
 
 _ATTEMPT_FIELDS = frozenset(item.name for item in dataclasses.fields(Attempt))
+_ATTEMPT_OPTIONAL: dict[str, Any] = {
+    "session_id": None,
+    "changed_files": [],
+    "unconfirmed_files": [],
+    "files_overflow": 0,
+    "reason": None,
+    "own_violations": 0,
+}
+_ATTEMPT_REQUIRED = _ATTEMPT_FIELDS - frozenset(_ATTEMPT_OPTIONAL)
 _ATTEMPT_DEFAULTS = {
     key: value for key, value in Attempt(0).to_dict().items() if key not in _V1_ATTEMPT_FIELDS
 }
@@ -399,10 +451,17 @@ class Task:
     # Each for_each expansion gets a new generation, and its items carry it, so a
     # re-expanded "verify#1" is never mistaken for an earlier expansion's item.
     generation: int = 0
-    # Live progress only; never persisted.
+    # Live progress only; never persisted. The child-authored ones are shown, never acted on.
     current_tool: str | None = None
     elapsed_ms: int = 0
     context_tokens: int = 0
+    approval: str | None = None  # e.g. "awaiting approval: edit": a human is being asked
+    stuck: str | None = None  # "repeat" or "error loop", as the host detects it
+    wrapping_up: bool = False
+
+    def clear_live(self) -> None:
+        self.current_tool = self.approval = self.stuck = None
+        self.wrapping_up = False
 
     @property
     def id(self) -> str:
@@ -935,7 +994,7 @@ class Workflow:
             if task.state == "running":
                 task.state = "interrupted"
                 task.note = note
-                task.current_tool = None
+                task.clear_live()
                 if task.attempts and task.attempts[-1].status == "running":
                     task.attempts[-1].status = "interrupted"
                     task.attempts[-1].failure = "interrupted"
@@ -1022,6 +1081,9 @@ class Workflow:
     def restore(cls, raw: Any) -> Workflow:
         if isinstance(raw, dict) and raw.get("schema_version") == 1:
             raw = _migrate_v1(raw)
+        if isinstance(raw, dict) and raw.get("schema_version") == 2:
+            # Version 3 only adds: optional attempt fields and the wrapped_up kind.
+            raw = {**raw, "schema_version": SCHEMA_VERSION}
         if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
             raise WorkflowError("Unsupported workflow snapshot version.")
         if set(raw) - _RUN_KEYS:
@@ -1030,7 +1092,9 @@ class Workflow:
         if not isinstance(items, list) or any(not isinstance(t, dict) for t in items):
             raise WorkflowError("Invalid workflow snapshot tasks.")
         run = cls.create(
-            raw.get("goal"), [t.get("spec") for t in items], raw.get("max_concurrency")
+            raw.get("goal"),
+            [_without_agent_timeout(t.get("spec")) for t in items],
+            raw.get("max_concurrency"),
         )
         run.id = text_field(raw.get("id"), "run_id", limit=48)
         if not _ID.fullmatch(run.id):
@@ -1134,7 +1198,11 @@ def _restore_extras(task: Task, raw: dict[str, Any]) -> None:
         raise WorkflowError("An expanded for_each task needs its expansion generation.")
 
 
-_V1_DEFAULT_TIMEOUT_MS = 120_000
+def _without_agent_timeout(spec: Any) -> Any:
+    """Agent tasks once carried a time limit; the host no longer applies one, so it is moot."""
+    if isinstance(spec, dict) and spec.get("kind") in {None, "agent"} and "timeout_ms" in spec:
+        return {key: value for key, value in spec.items() if key != "timeout_ms"}
+    return spec
 
 
 def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1158,11 +1226,5 @@ def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
             if status not in {"ok", "running"}:
                 failure = status if status in FAILURE_KINDS else "error"
             upgraded.append({**copy.deepcopy(_ATTEMPT_DEFAULTS), **attempt, "failure": failure})
-        spec = task.get("spec")
-        timeout = spec.get("timeout_ms") if isinstance(spec, dict) else None
-        if type(timeout) is int and timeout == _V1_DEFAULT_TIMEOUT_MS:
-            # Version 1 wrote every field, so its default is indistinguishable from a choice;
-            # like an unset limit now, it defers to the profile.
-            spec = {key: value for key, value in spec.items() if key != "timeout_ms"}
-        migrated.append({**task, "spec": spec, "attempts": upgraded})
+        migrated.append({**task, "attempts": upgraded})
     return {**raw, "schema_version": SCHEMA_VERSION, "tasks": migrated}

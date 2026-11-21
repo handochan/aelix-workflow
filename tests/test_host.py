@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import dataclasses
+import json
 from types import SimpleNamespace
 
+import pytest
 from aelix_agent_core.harness.core import AgentHarness, AgentHarnessOptions
 from aelix_agent_core.harness.hooks import ToolCallResult
 from aelix_agent_core.session import JsonlSessionStorage, LocalFileSystem, Session
@@ -13,13 +17,17 @@ from aelix_agents.print_channel import narrow_tools
 from aelix_ai.messages import AssistantMessage, TextContent, ToolCallContent
 from aelix_ai.streaming import AssistantEndEvent, AssistantStartEvent, Model
 from aelix_ai.tools import ToolExecutionContext
+from aelix_coding_agent import subagent_contract
 from aelix_coding_agent.builtin.permission_mode import PermissionMode, PermissionPosture
 from aelix_coding_agent.extensions.api import Extension, ExtensionAPI, _ExtensionRuntime
 from aelix_coding_agent.subagent_contract import SubagentResult
 from test_model import spec
 
+from aelix_workflow import failures
 from aelix_workflow.extension import SNAPSHOT_TYPE, WorkflowExtension, setup
-from aelix_workflow.panel import WIDGET_KEY
+from aelix_workflow.panel import WIDGET_KEY, task_line
+
+CONTEXT = ToolExecutionContext()
 
 
 class RecordingChannel:
@@ -60,6 +68,26 @@ class RecordingUI:
         return self.answer
 
 
+@pytest.fixture
+async def jobs(monkeypatch):
+    """Background jobs on, the host's default: a real job service, as its CLI builds one.
+
+    Without one, the host leaves every delegation to its per-session live-child count.
+    """
+    from aelix_coding_agent.jobs import activation
+    from aelix_coding_agent.jobs.service import JobService
+
+    # The host's documented test seam: the gate on, and not switched off by a setting.
+    monkeypatch.setattr(activation, "ACTIVE", True)
+    monkeypatch.setattr(activation, "_switched_off", False)
+    settings: dict = {}  # backgroundJobs, read at each reservation
+    service = JobService(settings=lambda: settings)
+    activation.install_service(service)
+    yield SimpleNamespace(service=service, settings=settings)
+    await service.shutdown()
+    activation.install_service(None)
+
+
 async def bench(
     tmp_path,
     *,
@@ -70,6 +98,7 @@ async def bench(
     project_trusted=False,
     mode="on",
     tools="[read, write]",
+    jobs=None,
 ):
     agent_dir = tmp_path / "agent"
     profiles = agent_dir / "agents"
@@ -106,6 +135,13 @@ async def bench(
     controller = WorkflowExtension(ExtensionAPI(record, runtime), mode=mode)
     controller.install()
     records = [agent_record, record]
+    if jobs is not None:
+        from aelix_coding_agent.jobs.extension import JobsExtension
+
+        # As cli/entry.py wires it: the service's own extension comes first.
+        jobs_record = Extension(name=JobsExtension.name)
+        JobsExtension(jobs.service)(ExtensionAPI(jobs_record, runtime))
+        records.insert(0, jobs_record)
     if deny_run:
         guard = Extension(name="guard")
 
@@ -147,8 +183,11 @@ async def bench(
             session=session,
             stream_fn=stream,
             project_trusted=project_trusted,
+            notice_inbox=jobs is not None,
         )
     )
+    if jobs is not None:
+        await jobs.service.bind(harness, reason="startup")
     return SimpleNamespace(
         controller=controller,
         harness=harness,
@@ -343,12 +382,214 @@ async def test_prompt_admission_limit_is_shared_across_workflows(tmp_path):
     await b.harness.dispose()
 
 
-async def test_an_unset_timeout_reaches_the_host_as_its_own_default(tmp_path):
-    # Live run: the workflow's former 120 s default overrode the profile's (Aelix: 600 s).
+async def test_a_delegated_agent_gets_no_time_limit(tmp_path):
+    # The host ignores spawn's timeout_ms (its ADR-0276), so the workflow neither offers nor
+    # passes one; checks keep theirs.
     b = await bench(tmp_path)
+    runtime = b.runtime.subagents
+    spawn, calls = runtime.spawn, []
+
+    async def recording(resolved, task, **options):
+        calls.append(options)
+        return await spawn(resolved, task, **options)
+
+    runtime.spawn = recording
+    refused = await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [{**spec(), "timeout_ms": 60_000}]},
+        CONTEXT,
+    )
+    assert refused.is_error and "no time limit" in refused.content[0].text
+    assert not b.controller.runs
     await b.harness.prompt("Review using a workflow")
     assert len(b.channel.plans) == 1
-    assert b.channel.plans[0].timeout_ms is None
+    assert calls and all("timeout_ms" not in options for options in calls)
+    await b.harness.dispose()
+
+
+def no_delegation(b, agents=()):
+    """The session's identity (--agent, /agents use) with this `agents:` list."""
+    impl = b.controller.api.runtime.subagents
+    impl.host = dataclasses.replace(
+        impl.host, active_profile=lambda: SimpleNamespace(name="lead", agents=agents)
+    )
+
+
+async def test_an_identity_that_delegates_to_nobody_refuses_the_plan(tmp_path):
+    b = await bench(tmp_path)
+    no_delegation(b)
+    with pytest.raises(subagent_contract.DelegationNotAllowed):
+        b.runtime.subagents.resolve_for_model("reviewer")
+    result = await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT
+    )
+    text = result.content[0].text
+    assert result.is_error
+    # The host's sentence, written for the model, reaches it whole.
+    assert "profile 'reviewer' is not available" in text
+    assert "'lead', whose agents: list is empty, so it delegates to no profile" in text
+    assert not b.controller.runs
+    await b.harness.prompt("Review using a workflow")
+    assert not b.channel.plans
+    await b.harness.dispose()
+
+
+async def test_a_delegation_policy_changed_after_planning_is_applied_at_run(tmp_path):
+    b = await bench(tmp_path)
+    no_delegation(b, agents=("reviewer",))
+    planned = await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT
+    )
+    assert not planned.is_error
+    no_delegation(b, agents=("implementer",))
+    result = await b.controller.run({"run_id": b.controller.selected}, CONTEXT)
+    assert result.is_error
+    assert "Profile 'reviewer' is not available" in result.content[0].text
+    assert "is not one this session's profile 'lead' may delegate to" in result.content[0].text
+    assert not b.channel.plans
+    assert b.controller.runs[b.controller.selected].attempt_count == 0
+    await b.harness.dispose()
+
+
+class OlderRuntime:
+    """A delegation runtime with only the SubagentRuntime protocol's resolve_profile."""
+
+    def __init__(self):
+        self.calls = []
+
+    def resolve_profile(self, name, *, allow_project=False):
+        self.calls.append((name, allow_project))
+        return SimpleNamespace(name=name)
+
+
+def offline_controller(runtime):
+    return WorkflowExtension(SimpleNamespace(runtime=SimpleNamespace(subagents=runtime)))
+
+
+async def test_a_runtime_without_the_model_door_cannot_delegate_for_a_workflow():
+    # The host's contract has the model door, so its policy applies; this runtime cannot
+    # answer for it, and the contract says the tool then refuses.
+    runtime = OlderRuntime()
+    controller = offline_controller(runtime)
+    controller.mode = "on"
+    result = await controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT
+    )
+    assert result.is_error
+    assert "cannot tell which agent profiles the model may use" in result.content[0].text
+    assert not runtime.calls
+    assert not controller.runs
+
+
+def test_an_older_host_without_the_model_door_keeps_the_project_refusal(monkeypatch):
+    # The released beta.2 contract has no ModelDelegation and no delegation policy.
+    monkeypatch.delattr(subagent_contract, "ModelDelegation")
+    runtime = OlderRuntime()
+    resolved = offline_controller(runtime)._resolve("reviewer")
+    assert resolved.name == "reviewer"
+    assert runtime.calls == [("reviewer", False)]
+
+
+async def test_with_background_jobs_on_a_workflow_child_holds_a_job_slot(tmp_path, jobs):
+    b = await bench(tmp_path, jobs=jobs)
+    # The delegation kind is registered, so every spawn reserves from the job service.
+    assert b.runtime.subagents.host.reserve is not None
+    record, held = b.channel.run, []
+
+    async def channel(plan, *, child=None, on_stream=None):
+        held.append(jobs.service.admission.count("agent"))
+        return await record(plan, child=child, on_stream=on_stream)
+
+    b.channel.run = channel
+    await b.harness.prompt("Review using a workflow")
+    assert held == [1]
+    assert jobs.service.admission.count("agent") == 0
+    run = b.controller.runs[b.controller.selected]
+    assert run.tasks["inspect"].state == "succeeded"
+    assert run.tasks["inspect"].attempts[0].child_id == b.channel.plans[0].id
+    await b.harness.dispose()
+
+
+def recording_spawns(b):
+    """Every envelope the host's spawn returns, refusals included."""
+    runtime, results = b.runtime.subagents, []
+    spawn = runtime.spawn
+
+    async def recording(resolved, task, **options):
+        results.append(await spawn(resolved, task, **options))
+        return results[-1]
+
+    runtime.spawn = recording
+    return results
+
+
+FULL = (
+    "Delegation refused: 1 delegated agent already runs; this limit is set in settings "
+    "backgroundJobs.limits.agents. Stop one or wait; do not retry."
+)
+
+
+async def test_with_background_jobs_on_a_slot_held_outside_the_run_is_waited_out(tmp_path, jobs):
+    jobs.settings["limits"] = {"agents": 1}
+    b = await bench(tmp_path, jobs=jobs)
+    b.controller.engine.retry_delays = (0.05, 0.05)
+    results = recording_spawns(b)
+    # Another delegation holds the only slot, as an agent call reserves before its dialog.
+    other = jobs.service.reserve("agent", 1)
+    await b.controller.plan({"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT)
+    task = b.controller.runs[b.controller.selected].tasks["inspect"]
+
+    async def free_after_the_refusal():
+        while not results:
+            await asyncio.sleep(0.005)
+        other.release()
+
+    freeing = asyncio.create_task(free_after_the_refusal())
+    result = await b.controller.run({"run_id": b.controller.selected}, CONTEXT)
+    await freeing
+    refused = results[0]
+    # The host's real sentence, and the same attempt tried again once the slot is free.
+    assert refused.error == FULL and refused.started is False
+    assert failures.capacity(refused) and failures.classify(refused) == "transient"
+    assert [(a.status, a.trigger) for a in task.attempts] == [("ok", "run")]
+    assert not result.is_error and task.state == "succeeded"
+    assert len(b.channel.plans) == 1
+    assert b.controller.remaining == 15
+    assert jobs.service.admission.count("agent") == 0
+    await b.harness.dispose()
+
+
+async def test_with_background_jobs_on_a_task_waits_for_its_sibling_to_free_the_slot(
+    tmp_path, jobs
+):
+    jobs.settings["limits"] = {"agents": 1}
+    b = await bench(tmp_path, jobs=jobs)
+    results = recording_spawns(b)
+    await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [spec("a"), spec("b")]}, CONTEXT
+    )
+    run = b.controller.runs[b.controller.selected]
+    record, rows = b.channel.run, []
+
+    async def channel(plan, *, child=None, on_stream=None):
+        # The first child holds the only slot until the other task waits for it.
+        while len(b.channel.plans) == 0 and not any(
+            "free agent slot" in t.note for t in run.tasks.values()
+        ):
+            await asyncio.sleep(0.005)
+        rows.extend(task_line(run, t) for t in run.tasks.values())
+        return await record(plan, child=child, on_stream=on_stream)
+
+    b.channel.run = channel
+    async with asyncio.timeout(10):
+        result = await b.controller.run({"run_id": run.id}, CONTEXT)
+    assert not result.is_error
+    assert [len(t.attempts) for t in run.tasks.values()] == [1, 1]
+    assert all(t.state == "succeeded" for t in run.tasks.values())
+    assert sorted(r.error or "" for r in results) == ["", "", FULL]
+    assert any("Waiting for a free agent slot" in row for row in rows)
+    # Two children, two admissions: the wait cost neither an attempt nor budget.
+    assert len(b.channel.plans) == 2 and b.controller.remaining == 14
+    assert jobs.service.admission.count("agent") == 0
     await b.harness.dispose()
 
 
@@ -374,3 +615,308 @@ async def test_a_profile_learns_which_requested_tools_its_child_lacked(tmp_path)
     assert run.tasks["inspect"].attempts[0].dropped_tools == expected
     assert "web_fetch" in expected
     await b.harness.dispose()
+
+
+async def test_a_change_in_what_a_running_child_waits_on_is_not_throttled_away(tmp_path):
+    ui = RecordingUI()
+    b = await bench(tmp_path, ui=ui)
+    await b.controller.plan({"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT)
+    task = b.controller.runs[b.controller.selected].tasks["inspect"]
+    task.state, task.current_tool = "running", "edit"
+    b.controller._render()
+    task.approval = "awaiting approval: edit"
+    b.controller._render(force=False)  # A progress tick: skipped only if nothing shown changed.
+    assert "awaiting approval: edit" in "\n".join(ui.widgets[-1][1])
+    await b.harness.dispose()
+
+
+def wrapped_up(plan, child, answer):
+    """The envelope and row a consumed wrap-up leaves, through the host's own envelope code."""
+    from aelix_agents.command_wire import new_wrap_up
+    from aelix_agents.envelope import build_result
+
+    # As runtime.wrap_up records the request, and as the child's stream reads it and ends.
+    child.wrap_up = new_wrap_up("user")
+    child.stream.wrap_up_head, child.stream.wrap_up_read = child.wrap_up.head, True
+    child.stream.summary, child.stream.saw_agent_end = answer, True
+    child.state = "done"
+    return build_result(
+        id=plan.id,
+        profile=plan.resolved.name,
+        state=child.stream,
+        wrap_up=child.wrap_up,
+        wrap_up_consumed=True,
+    )
+
+
+async def test_a_child_wrapped_up_by_the_user_fails_its_task_and_the_run_goes_on(tmp_path):
+    b = await bench(tmp_path)
+    record = b.channel.run
+
+    async def channel(plan, *, child=None, on_stream=None):
+        if "task=a " not in plan.task:
+            return await record(plan, child=child, on_stream=on_stream)
+        b.channel.plans.append(plan)
+        return wrapped_up(plan, child, "Partial: route.py checked, session.py not reached.")
+
+    b.channel.run = channel
+    await b.controller.plan(
+        {
+            "action": "create",
+            "goal": "Review",
+            "tasks": [spec("a"), spec("b")],
+            "max_concurrency": 1,
+        },
+        CONTEXT,
+    )
+    result = await b.controller.run({"run_id": b.controller.selected}, CONTEXT)
+    run = b.controller.runs[b.controller.selected]
+    child = run.tasks["a"].attempts[0].child_id
+    # The host's envelope says aborted; its row says how: the wrap-up, not a stop.
+    row = next(r for r in b.runtime.subagents.controls.list() if r["id"] == child)
+    assert (row["end"], run.tasks["a"].attempts[0].status) == ("wrapped_up", "aborted")
+    assert run.tasks["a"].state == "failed"
+    assert run.tasks["a"].attempts[0].failure == "wrapped_up"
+    assert run.tasks["a"].output == ""  # A partial answer is no dependency result.
+    assert "session.py not reached" in run.tasks["a"].attempts[0].summary
+    assert run.tasks["b"].state == "succeeded"
+    assert "Halted" not in result.content[0].text
+    await b.harness.dispose()
+
+
+class StandInControls:
+    def __init__(self, reply):
+        self.reply, self.asked = reply, []
+
+    def list(self):
+        return []
+
+    async def wrap_up(self, child_id):
+        self.asked.append(child_id)
+        return self.reply
+
+
+async def running_workflow(b, tasks):
+    """A workflow whose children hold until released; the run task and the release."""
+    release = asyncio.Event()
+    record = b.channel.run
+
+    async def channel(plan, *, child=None, on_stream=None):
+        if on_stream is not None:
+            on_stream(child.stream)
+        await release.wait()
+        return await record(plan, child=child, on_stream=on_stream)
+
+    b.channel.run = channel
+    await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": tasks, "max_concurrency": 2}, CONTEXT
+    )
+    run = b.controller.runs[b.controller.selected]
+    runner = asyncio.create_task(b.controller.run({"run_id": run.id}, CONTEXT))
+    async with asyncio.timeout(5):
+        while not all(t.latest and t.latest.child_id for t in run.tasks.values()):
+            await asyncio.sleep(0.005)
+    return run, runner, release
+
+
+async def test_workflow_wrap_asks_the_running_children_through_the_hosts_controls(tmp_path):
+    b = await bench(tmp_path)
+    run, runner, release = await running_workflow(b, [spec("a"), spec("b")])
+    # The host's own door: this fake transport's child has no process to write to.
+    text = await b.controller.command("wrap a", None)
+    assert text == "a: not reached (the agent has not started yet; retry)"
+    controls = StandInControls({"outcome": "queued", "phase": "streaming"})
+    b.runtime.subagents.controls = controls
+    text = await b.controller.command("wrap", None)
+    assert controls.asked == [run.tasks["a"].latest.child_id, run.tasks["b"].latest.child_id]
+    assert text.splitlines() == [
+        "a: asked to wrap up; its next reply ends it",
+        "b: asked to wrap up; its next reply ends it",
+    ]
+    controls.reply = {
+        "outcome": "refused",
+        "reason": 'the agent has finished or was stopped; to go on, use action="resume"',
+    }
+    text = await b.controller.command("wrap b", None)
+    # A workflow task has no resume door, so the host's advice to resume is not passed on.
+    assert text == "b: not reached (the agent has finished or was stopped)"
+    release.set()
+    await runner
+    assert await b.controller.command("wrap", None) == (
+        "No workflow is executing, so no agent is running to wrap up."
+    )
+    await b.harness.dispose()
+
+
+async def test_workflow_wrap_targets_the_executing_run_and_never_becomes_a_goal(tmp_path):
+    b = await bench(tmp_path)
+    sent = []
+    b.controller._send = lambda text, ctx: sent.append(text)
+    await b.controller.plan({"action": "create", "goal": "Other", "tasks": [spec("x")]}, CONTEXT)
+    other = b.controller.selected
+    run, runner, release = await running_workflow(b, [spec("a"), spec("b")])
+    controls = StandInControls({"outcome": "queued"})
+    b.runtime.subagents.controls = controls
+    await b.controller.command(f"status {other}", None)
+    assert b.controller.selected == other
+    # The executing run, whatever /workflow status selected since.
+    assert (await b.controller.command("wrap", None)).splitlines()[0].startswith("a: asked")
+    assert len(controls.asked) == 2
+    for word in ("x", "missing", "docs"):
+        assert await b.controller.command(f"wrap {word}", None) == (
+            f"Workflow {run.id} has no running agent task {word}. Running agent tasks: a, b."
+        )
+    assert not sent
+    release.set()
+    await runner
+    await b.harness.dispose()
+
+
+async def test_workflow_wrap_followed_by_words_is_still_a_goal(tmp_path):
+    b = await bench(tmp_path)
+    sent = []
+    b.controller._send = lambda text, ctx: sent.append(text)
+    await b.controller.command("wrap up the release notes", None)
+    assert sent and sent[0].startswith("Workflow: wrap up the release notes")
+    # With nothing executing, one word after wrap is a goal too.
+    await b.controller.command("wrap docs", None)
+    assert sent[1].startswith("Workflow: wrap docs")
+    await b.harness.dispose()
+
+
+@pytest.mark.parametrize("action", ["create", "add", "revise"])
+async def test_a_plan_change_without_tasks_says_so_and_shows_one(tmp_path, action):
+    # A weak live model sent create with no tasks 16 times, each told only the bounds.
+    b = await bench(tmp_path)
+    await b.controller.plan({"action": "create", "goal": "Review", "tasks": [spec()]}, CONTEXT)
+    args = {"action": action, "goal": "Review"}
+    if action != "create":
+        args = {"action": action, "run_id": b.controller.selected, "reason": "more"}
+    result = await b.controller.plan(args, CONTEXT)
+    text = result.content[0].text
+    assert result.is_error
+    assert text.startswith(f"workflow_plan(action='{action}') needs tasks, an array of task")
+    example = json.loads(text.split("A minimal one: tasks=", 1)[1])
+    assert [sorted(t) for t in example] == [["id", "profile", "prompt", "title"]]
+    await b.harness.dispose()
+
+
+async def test_workflow_pause_stops_a_run_mid_turn_and_the_agent_is_told_to_wait(tmp_path):
+    b = await bench(tmp_path)
+    sent = []
+    b.controller._send = lambda text, ctx: sent.append(text)
+    assert await b.controller.command("pause", None) == (
+        "No workflow is executing, so there is nothing to pause."
+    )
+    run, runner, _release = await running_workflow(b, [spec("a"), spec("b")])
+    text = await b.controller.command("pause", None)
+    assert text.startswith(f"Pausing workflow {run.id}: ")
+    async with asyncio.timeout(5):
+        result = await runner  # The tool call returns; the turn's own task is not cancelled.
+    body = result.content[0].text
+    assert not result.is_error
+    assert "The user paused this workflow with /workflow pause; 2 running task(s) were " in body
+    assert "interrupted (a, b)" in body and "wait for the user" in body
+    assert [t.state for t in run.tasks.values()] == ["interrupted", "interrupted"]
+    # Until the user's next prompt the agent runs no workflow at all: not this one, and not
+    # the rest rebuilt as a new run. Planning stays allowed.
+    refused = await b.controller.run({"run_id": run.id}, CONTEXT)
+    assert refused.is_error
+    assert refused.content[0].text.startswith(f"The user paused workflow {run.id}")
+    planned = await b.controller.plan(
+        {"action": "create", "goal": "Rest", "tasks": [spec("x")]}, CONTEXT
+    )
+    assert not planned.is_error
+    b.channel.run = RecordingChannel().run
+    rebuilt = await b.controller.run({"run_id": b.controller.selected}, CONTEXT)
+    assert rebuilt.is_error and "Do not run any workflow now" in rebuilt.content[0].text
+    # A background job's result wakes the model: a notice turn, not the user's prompt.
+    b.controller.remaining = 3
+    notice = SimpleNamespace(system_prompt="base", prompt="", source="notice")
+    await b.controller.before_agent_start(notice, None)
+    assert b.controller.remaining == 3
+    assert (await b.controller.run({"run_id": run.id}, CONTEXT)).is_error
+    await b.controller.before_agent_start(SimpleNamespace(system_prompt="base"), None)
+    assert b.controller.remaining == 16
+    again = await b.controller.run({"run_id": run.id}, CONTEXT)
+    assert "The user paused" not in again.content[0].text
+    # With more words it is still a goal.
+    await b.controller.command("pause the deploy rollout", None)
+    assert sent and sent[0].startswith("Workflow: pause the deploy rollout")
+    await b.harness.dispose()
+
+
+async def test_workflow_continue_lifts_a_pause_typed_mid_turn(tmp_path):
+    b = await bench(tmp_path)
+    b.controller._send = lambda text, ctx: None
+    run, runner, _release = await running_workflow(b, [spec("a")])
+    await b.controller.command("pause", None)
+    await runner
+    assert (await b.controller.run({"run_id": run.id}, CONTEXT)).is_error
+    # Typed mid-turn it is a follow-up, not a prompt, so the command itself lifts the pause.
+    await b.controller.command(f"continue {run.id}", None)
+    b.channel.run = RecordingChannel().run
+    assert (
+        "The user paused"
+        not in (await b.controller.run({"run_id": run.id}, CONTEXT)).content[0].text
+    )
+    await b.harness.dispose()
+
+
+class AnsweringControls:
+    """The host's controls, except that the wrap-up door answers queued without a process."""
+
+    def __init__(self, real):
+        self.real = real
+
+    def list(self):
+        return self.real.list()
+
+    async def wrap_up(self, child_id):
+        return {"outcome": "queued"}
+
+
+async def test_a_wrap_up_the_user_asked_for_says_so_and_not_to_retry(tmp_path):
+    # Live: the model doubted who asked and retried at once.
+    b = await bench(tmp_path)
+    release = asyncio.Event()
+    record = b.channel.run
+
+    async def channel(plan, *, child=None, on_stream=None):
+        if on_stream is not None:
+            on_stream(child.stream)
+        await release.wait()
+        if "task=a " not in plan.task:
+            return await record(plan, child=child, on_stream=on_stream)
+        b.channel.plans.append(plan)
+        return wrapped_up(plan, child, "Partial: route.py checked.")
+
+    b.channel.run = channel
+    await b.controller.plan(
+        {"action": "create", "goal": "Review", "tasks": [spec("a"), spec("b")]}, CONTEXT
+    )
+    run = b.controller.runs[b.controller.selected]
+    runner = asyncio.create_task(b.controller.run({"run_id": run.id}, CONTEXT))
+    async with asyncio.timeout(5):
+        while not all(t.latest and t.latest.child_id for t in run.tasks.values()):
+            await asyncio.sleep(0.005)
+    b.runtime.subagents.controls = AnsweringControls(b.runtime.subagents.controls)
+    assert (await b.controller.command("wrap a", None)).startswith("a: asked to wrap up")
+    release.set()
+    result = await runner
+    a = run.tasks["a"]
+    assert a.attempts[0].failure == "wrapped_up"
+    assert a.note == (
+        "wrapped_up: the user asked this task to finish early with /workflow wrap; its reply is "
+        "partial. Do not retry it unless the user asks: report the partial result."
+    )
+    assert "the user asked this task to finish early with /workflow wrap" in result.content[0].text
+    await b.harness.dispose()
+
+
+def test_a_refund_never_raises_the_budget_above_its_limit(tmp_path):
+    controller = WorkflowExtension(SimpleNamespace(runtime=SimpleNamespace(subagents=None)))
+    controller.remaining = 15
+    controller._refund()
+    controller._refund()
+    assert controller.remaining == 16

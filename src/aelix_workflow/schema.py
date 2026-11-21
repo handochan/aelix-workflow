@@ -107,8 +107,10 @@ TASK_SCHEMA = {
             "type": "integer",
             "minimum": 1_000,
             "maximum": 1_800_000,
-            "description": "Optional. Agents default to their profile's limit (Aelix: 600000); "
-            "checks default to 600000.",
+            "description": "check only: stop the command after this many ms (default 600000). "
+            "Leave it out of agent tasks; a workflow sets no agent time limit. Current Aelix "
+            "has none (Ctrl+C or /workflow pause stops a child); an older one uses the "
+            "profile's own limit.",
         },
     },
     "required": ["id", "title"],

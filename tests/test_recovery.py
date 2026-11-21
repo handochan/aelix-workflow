@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from aelix_agent_core.session import JsonlSessionStorage, LocalFileSystem, Session
 from aelix_ai.messages import AssistantMessage, TextContent, ToolCallContent, ToolResultMessage
 from test_dynamic import FINDINGS
@@ -218,3 +219,26 @@ def test_item_markers_and_records_name_their_expansion():
             )
         ]
     )["k"].marker == (run.id, "verify#1", 1, 1)
+
+
+@pytest.mark.parametrize(
+    "settle",
+    [
+        {"status": "error", "usage": {"input": 10, "output": 5}},
+        {"status": "error", "turns": 1, "stop_reason": "end_turn"},
+    ],
+)
+async def test_a_recovered_childs_answer_is_not_read_as_a_host_refusal(tmp_path, settle):
+    # A child that ran left prose; its words about 401s are no authentication blocker.
+    parent = tmp_path / "--bucket--" / "parent.jsonl"
+    await write_child(
+        tmp_path / "--bucket--" / "parent" / "sub-1.jsonl",
+        edit_messages("Audit: 401 responses lack the WWW-Authenticate header."),
+    )
+    run = Workflow.create("Recover", [spec("a")])
+    recovery.apply_attempt_record(
+        run, {"v": 1, "run": run.id, "task": "a", "attempt": 1, "child_id": "sub-1"}
+    )
+    found = receipts(run, "a", 1, key="sub-1", rel="parent/sub-1.jsonl", settle=settle)
+    await recovery.reconcile(run, found, str(parent))
+    assert run.tasks["a"].attempts[0].failure == "error"

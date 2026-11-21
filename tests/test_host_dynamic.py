@@ -16,7 +16,7 @@ from test_host import RecordingUI, bench
 from test_model import spec
 
 from aelix_workflow.activation import requested_workflow
-from aelix_workflow.extension import ALLOW_CHECKS, WorkflowExtension
+from aelix_workflow.extension import ALLOW_CHECKS, SNAPSHOT_TYPE, WorkflowExtension
 from aelix_workflow.model import Workflow
 
 CONTEXT = ToolExecutionContext()
@@ -268,4 +268,129 @@ async def test_continue_resumes_with_an_explicit_request(tmp_path):
     assert requested_workflow(text)
     await b.controller.command("continue the refactor", None)
     assert sent[-1].content[0].text.startswith("Workflow: continue the refactor")
+    await b.harness.dispose()
+
+
+async def owed_after_restart(b):
+    """A run left as a stopped execution leaves it (fix done, its check failed with a repair
+    owed), saved, then a new session start: approvals are not persisted, so none is left."""
+    from aelix_workflow.model import Attempt
+
+    repaired = {**check_task("chk", deps=["fix"]), "repair": {"task": "fix", "max_rounds": 2}}
+    run = await create(b, [spec("fix"), repaired])
+    fix, chk = run.tasks["fix"], run.tasks["chk"]
+    fix.state, fix.attempts = "succeeded", [Attempt(1, status="ok", child_id="sub-old")]
+    chk.state = "failed"
+    chk.attempts = [Attempt(1, "error", summary="1 failed", failure="check_failed", exit_code=1)]
+    # Saved as the snapshot written when that execution ended.
+    await b.session.append_custom_entry(SNAPSHOT_TYPE, run.to_dict())
+    await b.controller.session_start(
+        None, SimpleNamespace(session_manager=SimpleNamespace(get_session=lambda: b.session))
+    )
+    return b.controller.runs[run.id]
+
+
+class CountingUI(RecordingUI):
+    """Records how many children existed when each dialog was shown."""
+
+    def __init__(self, answer, plans):
+        super().__init__(answer=answer)
+        self.plans, self.children_at_dialog = plans, []
+
+    async def select(self, title, options, opts=None):
+        self.children_at_dialog.append(len(self.plans))
+        return await super().select(title, options, opts)
+
+
+async def test_an_owed_repair_after_a_restart_is_approved_before_any_child(tmp_path):
+    ui = CountingUI(ALLOW_CHECKS, [])
+    b = await bench(tmp_path, ui=ui)
+    ui.plans = b.channel.plans
+    run = await owed_after_restart(b)
+    result = await b.controller.run({"run_id": run.id}, CONTEXT)
+    assert not result.is_error, result.content[0].text
+    # The check's command was asked about before the repair's child was started.
+    assert ui.children_at_dialog == [0] and "checked ok" in ui.dialogs[0][0]
+    assert len(b.channel.plans) == 1 and "1 failed" in b.channel.plans[0].task
+    chk = run.tasks["chk"]
+    assert (chk.state, chk.rounds, chk.output) == ("succeeded", 1, "checked ok")
+    await b.harness.dispose()
+
+
+@pytest.mark.parametrize("answer", ["Deny", "headless"])
+async def test_an_owed_repair_whose_command_is_not_approved_spends_no_child(tmp_path, answer):
+    ui = None if answer == "headless" else RecordingUI(answer=answer)
+    b = await bench(tmp_path, ui=ui)
+    run = await owed_after_restart(b)
+    await b.controller.run({"run_id": run.id}, CONTEXT)
+    chk = run.tasks["chk"]
+    assert not b.channel.plans
+    assert chk.state == "failed" and [a.failure for a in chk.attempts] == ["check_failed"]
+    assert chk.note.startswith(
+        "Its repair, rerunning fix, waits for the user to approve its command"
+    )
+    assert run.tasks["fix"].attempts[-1].child_id == "sub-old"
+    await b.harness.dispose()
+
+
+async def test_an_owed_repairs_target_is_checked_before_any_child(tmp_path):
+    from test_host import no_delegation
+
+    ui = RecordingUI(answer=ALLOW_CHECKS)
+    b = await bench(tmp_path, ui=ui)
+    run = await owed_after_restart(b)
+    no_delegation(b, agents=("implementer",))  # fix's profile is no longer one it may use
+    result = await b.controller.run({"run_id": run.id}, CONTEXT)
+    # Refused as the call itself, before the dialog: no attempt, no child.
+    assert result.is_error
+    assert result.content[0].text.startswith("Profile 'reviewer' is not available")
+    assert not b.channel.plans and not ui.dialogs
+    assert len(run.tasks["fix"].attempts) == 1
+    await b.harness.dispose()
+
+
+async def test_a_new_session_asks_about_every_check_a_repair_could_reset(tmp_path):
+    # The final review's probe: an owed repair of chkA resets chkB, another failed check on
+    # the same target that is neither pending nor owed; it used to run declined, unasked.
+    from aelix_workflow.model import Attempt
+
+    ui = CountingUI(ALLOW_CHECKS, [])
+    b = await bench(tmp_path, ui=ui)
+    ui.plans = b.channel.plans
+    owed = {**check_task("chkA", "print('A ok')", ["fix"]), "repair": {"task": "fix"}}
+    run = await create(b, [spec("fix"), owed, check_task("chkB", "print('B ok')", ["fix"])])
+    run.tasks["fix"].state = "succeeded"
+    run.tasks["fix"].attempts = [Attempt(1, status="ok", child_id="sub-old")]
+    for task_id in ("chkA", "chkB"):
+        task = run.tasks[task_id]
+        task.state = "failed"
+        task.attempts = [Attempt(1, "error", summary="failed", failure="check_failed", exit_code=1)]
+    await b.session.append_custom_entry(SNAPSHOT_TYPE, run.to_dict())
+    await b.controller.session_start(
+        None, SimpleNamespace(session_manager=SimpleNamespace(get_session=lambda: b.session))
+    )
+    run = b.controller.runs[run.id]
+    await b.controller.run({"run_id": run.id}, CONTEXT)
+    # One dialog, before any child, listing both commands.
+    assert ui.children_at_dialog == [0]
+    assert "A ok" in ui.dialogs[0][0] and "B ok" in ui.dialogs[0][0]
+    assert len(b.channel.plans) == 1
+    for task_id, output in (("chkA", "A ok"), ("chkB", "B ok")):
+        task = run.tasks[task_id]
+        assert (task.state, task.output) == ("succeeded", output)
+        assert all(a.failure != "declined" for a in task.attempts)
+    await b.harness.dispose()
+
+
+async def test_no_dialog_when_no_check_is_pending_or_owes_a_repair(tmp_path):
+    from aelix_workflow.model import Attempt
+
+    ui = RecordingUI(answer=ALLOW_CHECKS)
+    b = await bench(tmp_path, ui=ui)
+    run = await create(b, [spec("a"), check_task("done")])
+    done = run.tasks["done"]
+    done.state, done.attempts = "succeeded", [Attempt(1, "ok", summary="checked ok", exit_code=0)]
+    await b.controller.run({"run_id": run.id}, CONTEXT)
+    assert not ui.dialogs
+    assert run.tasks["a"].state == "succeeded" and len(b.channel.plans) == 1
     await b.harness.dispose()

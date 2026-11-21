@@ -35,7 +35,6 @@ def main() -> int:
                 "profile": config.profile,
                 "phase": "Smoke",
                 "prompt": f"Read {root / 'README.md'} with the read tool. Return WORKFLOW_CHILD_LIVE_OK, its first heading, and the three workflow tool names. Do not modify files.",
-                "timeout_ms": 60_000,
             }
         ],
     }

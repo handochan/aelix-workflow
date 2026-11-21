@@ -573,6 +573,7 @@ async def test_a_report_keeps_results_of_a_replaced_expansion_apart():
 
 async def test_a_timeout_without_output_explains_itself():
     # Live run: a timed-out child left no summary or error, and the note read "timeout: ".
+    # Only an older host still ends an agent this way, and no task setting changes its limit.
     run = Workflow.create("Slow", [spec("a")])
 
     async def delegate(task, _prompt, _on_event):
@@ -582,6 +583,7 @@ async def test_a_timeout_without_output_explains_itself():
     task = run.tasks["a"]
     assert task.attempts[0].failure == "timeout"
     assert task.note == (
-        "timeout: the child ran out of time after 120s; raise timeout_ms or narrow the task "
-        "before retrying"
+        "timeout: the child ran out of time after 120s at its profile's time limit, which only "
+        "the profile can raise; narrow or split the task before retrying"
     )
+    assert "timeout_ms" not in task.note

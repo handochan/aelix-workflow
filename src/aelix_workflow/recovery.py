@@ -11,6 +11,7 @@ the tool calls its session file shows, for an informed retry decision.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ _MARKER = re.compile(
     r"(?: expansion=(\d+))?\]"
 )
 _SETTLE_STATUSES = {"ok", "error", "timeout", "aborted"}
+_HAS_STARTED = any(f.name == "started" for f in dataclasses.fields(SubagentResult))
 
 
 def attempt_record(run: Workflow, task: Task, attempt: Attempt) -> dict[str, Any]:
@@ -217,6 +219,12 @@ def _result(receipt: Receipt, transcript: Transcript | None) -> SubagentResult:
     status = settle.get("status")
     error = settle.get("error") if isinstance(settle.get("error"), str) else None
     cost = usage.get("cost")
+    turns = number(settle.get("turns"))
+    stop_reason = settle.get("stop_reason") if isinstance(settle.get("stop_reason"), str) else None
+    # A child that answered, spent tokens or took a turn ran: its answer is prose, not a
+    # refusal to read by its words (failures.classify). Without `started`, usage decides.
+    ran = bool(answer or turns or number(usage.get("input")) or number(usage.get("output")))
+    extra: dict[str, Any] = {"started": ran} if _HAS_STARTED else {}
     return SubagentResult(
         id=receipt.key,
         profile=str(settle.get("profile", "")),
@@ -227,8 +235,10 @@ def _result(receipt: Receipt, transcript: Transcript | None) -> SubagentResult:
             input=number(usage.get("input")),
             output=number(usage.get("output")),
             cost=float(cost) if isinstance(cost, int | float) else 0.0,
+            turns=turns,
         ),
         error=error,
+        stop_reason=stop_reason,
         elapsed_ms=number(settle.get("elapsed_ms")),
         model=settle.get("model") if isinstance(settle.get("model"), str) else None,
         permission_mode=(
@@ -237,6 +247,7 @@ def _result(receipt: Receipt, transcript: Transcript | None) -> SubagentResult:
             else None
         ),
         tool_trail=transcript.trail if transcript else None,
+        **extra,
     )
 
 

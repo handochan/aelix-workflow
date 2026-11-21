@@ -65,6 +65,28 @@ def matches(path: str, scope: Iterable[str]) -> bool:
     return any(_pattern(glob).fullmatch(path) for glob in scope)
 
 
+def project_path(path: str) -> str | None:
+    """A host-reported path in the form scopes use, or None for one outside the project.
+
+    The host shows a path inside the parent's directory relative to it with ``/`` on every
+    platform, one that climbed out as ``../…``, and an absolute or ``~`` one as the child
+    wrote it (``runtime._display_path``). A backslash is part of a POSIX name, so it stays.
+    The host runs in this process, so this platform's ``os.path`` reads its absolute paths.
+    """
+    local = path
+    while local.startswith("./"):
+        local = local[2:]
+    if (
+        not local
+        or local.startswith("~")
+        or os.path.isabs(local)
+        or os.path.splitdrive(local)[0]
+        or ".." in local.split("/")
+    ):
+        return None
+    return local
+
+
 def changed(before: Snapshot, after: Snapshot) -> set[str]:
     return {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
 

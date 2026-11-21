@@ -13,6 +13,10 @@ can add new investigations, revise invalid assumptions, retry interrupted work, 
 
 ## Develop and run
 
+This version targets Aelix at `83714045` or later. On the released beta.2 it is best effort and
+not covered by the tests; the host's version string is still `0.1.0b2`, so the dependency floor
+cannot say so yet.
+
 This checkout uses the sibling `../../aelix-ai` source for development. Build a wheel for use
 in another environment; the published dependency metadata contains no local paths.
 
@@ -39,6 +43,9 @@ profiles are required for delegation. In the TUI:
 /workflow status
 /workflow status <run_id> <task_id>
 /workflow continue
+/workflow pause
+/workflow wrap
+/workflow wrap <task_id>
 /workflow hide
 /workflow show
 /workflow mode
@@ -48,6 +55,14 @@ profiles are required for delegation. In the TUI:
 
 `/workflow continue [run_id]` asks the agent to resume a paused or budget-limited run; it is an
 explicit workflow request, so it also works in mode off.
+
+`/workflow wrap [task_id]` asks the running agents of the executing run, or of that one task, to
+finish now: each makes one more reply, without tools, and its task fails as `wrapped_up` with
+that partial reply. Type it while the workflow runs; Aelix runs an extension's command during a
+turn. While a run executes, `/workflow wrap` and `/workflow wrap <word>` are always this command
+(an unknown or idle task ID is answered with the running ones); otherwise longer text is a goal.
+It needs an Aelix whose delegation runtime offers child controls, and says what each request
+reached.
 
 ## Workflow activation
 
@@ -80,12 +95,30 @@ append API. `/resume`, `/reload` and `/fork` restore the preference on the selec
 
 The panel above the editor shows the goal, revision, workflow state, task states, failure kinds,
 dependency and shared-file waits, fan-out progress, repair rounds, current child tool, elapsed
-time, context tokens and spend. Running items appear under their group; running and failed tasks
-come first. `/workflow status` includes all tasks and their attempt history.
+time, context tokens and spend. A child waiting for a human's answer (`awaiting approval: edit`)
+shows that instead of its tool, a child the host finds stuck is marked `stuck: repeat` or
+`stuck: error loop`, and one asked to finish is marked `wrapping up`. A task waiting for a free
+agent slot says so. Running items appear under their group; running and failed tasks come
+first. `/workflow status` includes all tasks and their attempt history.
 
-Ctrl+C **pauses** execution: running work becomes interrupted and needs an explicit retry after
-its side effects are reviewed; work that never started stays pending, and the graph stays
-editable. `workflow_plan(action='cancel')` ends a run.
+Ctrl+C or `/workflow pause` **pauses** execution. A running task whose agent had been asked for
+becomes interrupted and needs an explicit retry after its side effects are reviewed: the
+extension cannot tell whether that agent had started (its consent dialog may still have been
+open), so it assumes it may have. A task stopped before its agent was asked for, or while it
+waited for a free agent slot, goes back to pending, with its attempt and admission given back.
+Tasks that had not been launched stay pending, and the graph stays editable. A check repair that
+the stopped execution still owed is taken up by the next `workflow_run`, once the check's command
+is approved for that run: its dialog comes before any child, as for a pending check. Denied, or
+with no interactive TUI to ask, the repair waits and no child is spent. Reports say when a repair
+is owed; retrying, revising or skipping the check cancels it.
+`workflow_plan(action='cancel')` ends a run.
+
+A run started by `/workflow <goal>` or `/workflow continue` is paused with `/workflow pause`:
+the current Aelix TUI does not treat a turn an extension started as running, so Ctrl+C and Esc
+do not reach it. A run started from a typed request takes either. `/workflow pause` stops the
+executing run's agents and hands the turn back: the agent is told the user paused the run, and
+it can run no workflow, that one or a new one, until your next prompt or `/workflow continue`.
+A turn that a background job's result starts is not your prompt and lifts nothing.
 
 The host's permission mode and each profile's `approval_mode` determine write authority.
 A default-mode parent with an inherited profile produces read-only children. For implementation
@@ -146,7 +179,7 @@ against the declared schemas when the plan is written.
 | `output_schema` | JSON Schema subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, length/size/number bounds). The child ends with a `json` fence that must satisfy it; otherwise the task fails as `invalid_output`. Successors receive the data |
 | `for_each`, `where`, `max_items` | Run one child per element of a dependency's array result (`verify#1`, `verify#2`, …), optionally filtered. More than `max_items` (≤16) fails the group instead of dropping work. Prompts may use `{{item}}`, `{{item.field}}`, `{{index}}` |
 | `when` | Skip the task when a condition on a dependency result is false. Such a skip satisfies successors; a manual skip does not |
-| `kind: "check"`, `command` | Run a command (argv, no shell) in the project and pass on exit code 0. The user approves each distinct command once per workflow, before any child starts |
+| `kind: "check"`, `command` | Run a command (argv, no shell) in the project and pass on exit code 0. The user approves each distinct command once per workflow, before any child starts; when a check will run, the dialog lists every command a check of the run could still need, since a repair can reset other checks. `timeout_ms` stops it (default 600 seconds) |
 | `repair` | On a failed check, rerun an upstream agent task with the failure output, then re-check, up to `max_rounds` (≤3) |
 | `access`, `writes` | `access: "write"` marks a task that must change files; `writes` lists the globs it owns |
 
@@ -172,35 +205,60 @@ against the declared schemas when the plan is written.
 ## Failures and recovery
 
 Each attempt records why it failed: `declined`, `aborted`, `timeout`, `blocker`, `transient`,
-`invalid_output`, `read_only`, `check_failed`, `error` or `interrupted`.
+`invalid_output`, `read_only`, `check_failed`, `error`, `interrupted` or `wrapped_up`. `timeout`
+comes from a check that ran out of time, or from an older Aelix, which ends a delegated agent at
+its profile's own time limit.
 
 - `aborted` (stopped from outside, including session teardown) and `blocker` (authentication,
   credit, model or delegation availability) stop new admissions for the run; running children
   finish.
+- `wrapped_up`: the child was asked to finish early (`/workflow wrap`, or an RPC host) and
+  concluded with a partial reply. Its task fails, the run goes on, and it is never retried
+  automatically. Its note tells the agent who asked (the user, when it was `/workflow wrap`) and
+  not to retry it unless the user asks.
 - Only a `transient` failure of a child that ran no tool is retried automatically (twice at most).
   Any other failure waits for the parent, because the child may have changed the workspace.
+- A delegation the host refuses because its limit of running agents is reached costs no further
+  attempt or admission: the task keeps the one it was launched with. With background jobs on
+  (Aelix's default) the limit is
+  `backgroundJobs.limits.agents` or `backgroundJobs.maxTotal`, otherwise the per-session
+  live-agent cap. While another task of the run holds a slot, the refused task keeps its own
+  concurrency slot and waits for one to finish, then tries again. When none of the run's tasks
+  holds one, it tries again after 2 and 8 seconds (apart from the two retries of other transient
+  failures), then fails as `transient`. A halt ends these waits at once, and a pause or Ctrl+C
+  returns a waiting task to `pending` with its attempt and admission given back, since no agent
+  of it had started.
 - A write task fails before any spawn if its profile has no `edit`, `write` or `bash` tool under
   the current grant, and fails as `read_only` if its child ran in `plan` mode.
 
-Snapshots (schema 2; schema 1 snapshots migrate) are written at plan changes, execution
+Snapshots (schema 3; schemas 1 and 2 migrate; version 0.2.0 refuses schema 3) are written at plan changes, execution
 boundaries, dynamic steps and attempt completion. A small attempt record is written as soon as
 a child starts, and every child prompt starts with a `[aelix-workflow run=… task=… attempt=…]`
 marker that Aelix keeps in its own spawn receipt. After a crash or restart, started work is
 restored as interrupted with its child ID. A child that settled successfully is recovered from
 its own session file instead of being re-run; an unsettled child is reported with the tool calls
-its session file shows.
+its session file shows. Where Aelix reports them, an attempt also keeps the child's session ID,
+the files it wrote (with any it was stopped while writing), and the host's one line on why a run
+did not finish; `workflow_status(run_id, task_id)` shows them.
 
 ## Execution boundaries
 
 - 1–4 concurrent tasks, at most 64 tasks including fan-out items, 16 items per fan-out,
   128 attempts per run, and 16 admissions per user prompt shared across all workflows.
-  Timeouts are 1–1,800 seconds per task. Without `timeout_ms` an agent task gets its
-  profile's limit (Aelix default 600 seconds), as the `agent` tool does; checks get 600.
+  A check's `timeout_ms` is 1–1,800 seconds (default 600). A workflow sets no time limit for a
+  delegated agent, so an agent task that sets `timeout_ms` is refused. Current Aelix has none
+  (Ctrl+C or `/workflow pause` stops a running workflow); an older Aelix ends a child at its profile's own limit
+  (600 seconds by default), which only the profile can raise. A stored snapshot's agent
+  `timeout_ms` is dropped when it is restored.
   A child prompt is at most 60,000 UTF-8 bytes; dependency evidence is cut at character
   boundaries to fit.
 - Every child uses the host's public consent-taking `SubagentRuntime.spawn` contract. Profiles
-  resolve with `allow_project=False`; no private grants, subprocess launcher, or permission
-  widening is introduced. The parent must have an active `agent` tool.
+  resolve through the host's door for model-chosen delegations (`resolve_for_model`), so the
+  `agents` settings and the session identity's `agents:` list limit a workflow as they limit
+  the `agent` tool, and a project-scoped profile is refused. On a host whose runtime cannot
+  answer that door, workflows do not delegate; a host from before it resolves with
+  `allow_project=False`. No private grants, subprocess launcher, or permission widening is
+  introduced. The parent must have an active `agent` tool.
 - The public spawn contract currently has no model-tool receipt argument and does not charge
   the built-in `agent` tool's per-prompt counter. This extension applies its own 16-admission
   counter and stores the task-to-child association in its workflow snapshots. Consent is taken
@@ -218,8 +276,12 @@ its session file shows.
 - Execution is foreground; live TUI updates continue while the tool is awaited. Background
   runs, generated-script execution, peer messaging, process resurrection, and isolated write
   worktrees remain later work. Parallel children share the host working directory: tasks with
-  overlapping `writes`, writers without `writes`, and checks never run at the same time. In a
-  trusted project, a lock-free `git status` records changes outside a task's declared scope.
+  overlapping `writes`, writers without `writes`, and checks never run at the same time. A file
+  a child wrote through `edit` or `write` outside its task's `writes` (any file, for a read
+  task) is recorded against that child, from the host's own record of its calls, in any
+  project. In a trusted project, a lock-free `git status` also records changes outside a task's
+  declared scope, including those made through `bash`; concurrent writers share that allowance.
+  Reports keep the two apart, so only git's entries may be another task's.
 
 ## Verification
 
@@ -253,5 +315,6 @@ arguments select a provider explicitly; otherwise the check uses your current Ae
 See [the reference investigation](docs/references.md), the design decisions
 ([graph and delegation](docs/decisions/0001-adaptive-graph-and-host-delegation.md),
 [activation modes](docs/decisions/0002-proactive-and-explicit-workflow-modes.md),
-[dynamic steps, failures and recovery](docs/decisions/0003-dynamic-steps-failure-semantics-and-recovery.md)),
+[dynamic steps, failures and recovery](docs/decisions/0003-dynamic-steps-failure-semantics-and-recovery.md),
+[the host's delegation policy and signals](docs/decisions/0004-following-the-hosts-delegation-policy-and-signals.md)),
 and [verification evidence](docs/verification.md).

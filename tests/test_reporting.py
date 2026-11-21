@@ -109,7 +109,7 @@ def test_overview_and_task_detail():
     detail = task_detail(run, item)
     assert 'Item 1: {"file":"a.py"}' in detail
     assert "    edit(a.py) FAILED" in detail
-    assert "changed outside writes: README.md" in detail
+    assert "seen by git (concurrent tasks may share blame): README.md" in detail
     assert "child: sub-7" in detail
     assert "Command: python -m pytest" in task_detail(run, run.tasks["tests"])
 
@@ -174,7 +174,12 @@ def test_a_timed_out_attempt_has_no_empty_result_and_keeps_its_own_symbol():
     assert "result:" not in detail
     assert "! attempt a #1 · timeout" in detail
     assert "~ attempt a #2" in detail
-    assert "timeout profile default" in detail
+    # A delegated agent has no time limit, so its task shows none; a check shows its own.
+    assert "timeout" not in detail.splitlines()[0]
+    checked = Workflow.create(
+        "Check", [{"id": "c", "title": "c", "kind": "check", "command": ["true"]}]
+    )
+    assert " | timeout 600s" in task_detail(checked, checked.tasks["c"]).splitlines()[0]
     report = run_report(run, Execution(finished=[(task, task.attempts[0])]))
     assert "! a #1 · timeout" in report
     assert "\n  \n" not in report + "\n"
@@ -208,3 +213,31 @@ def test_a_blank_summary_never_breaks_the_overview():
     run.tasks["a"].attempts = [Attempt(1, "ok", summary="\n")]
     text = overview(run)
     assert "+ a #1 | succeeded | [Work] a\n" in text + "\n"
+
+
+def test_task_detail_shows_what_the_host_reports_compactly():
+    run = Workflow.create("Files", [spec("a")])
+    task = run.tasks["a"]
+    task.state = "failed"
+    task.attempts = [
+        Attempt(
+            1,
+            "error",
+            child_id="sub-1",
+            failure="error",
+            session_id="0193-child",
+            changed_files=[f"src/m{n}.py" for n in range(10)],
+            unconfirmed_files=["src/half.py"],
+            files_overflow=5,
+            reason="the agent closed its output but did not exit within 30 s",
+        )
+    ]
+    detail = task_detail(run, task)
+    assert (
+        "  child: sub-1 | session record 0193-child (not resumable with the agent tool)" in detail
+    )
+    assert "  ended: the agent closed its output but did not exit within 30 s" in detail
+    assert "  changed: src/m0.py, " in detail and "src/m7.py, +7 more" in detail
+    assert "src/m8.py" not in detail
+    assert "  write unconfirmed (stopped mid-write): src/half.py" in detail
+    assert "resume" not in detail

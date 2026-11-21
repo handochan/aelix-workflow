@@ -62,6 +62,11 @@ def status_line(run: Workflow) -> str:
     return " | ".join(parts)
 
 
+def _short(child_id: str) -> str:
+    """Enough of an ID to tell children apart on a narrow row: 'sub-4389…'."""
+    return child_id if len(child_id) <= 9 else child_id[:8] + "…"
+
+
 def state_label(task: Task) -> str:
     attempt = task.latest
     failure = attempt.failure if attempt else None
@@ -70,7 +75,7 @@ def state_label(task: Task) -> str:
     return task.state
 
 
-def task_line(run: Workflow, task: Task) -> str:
+def task_line(run: Workflow, task: Task, *, short_ids: bool = False) -> str:
     if task.items is not None:
         counts = Counter(i.state for i in task.items)
         detail = f"{counts['succeeded']}/{len(task.items)} items"
@@ -78,10 +83,20 @@ def task_line(run: Workflow, task: Task) -> str:
             if counts[state]:
                 detail += f", {counts[state]} {state}"
     elif task.state == "running":
-        detail = task.current_tool or ("checking" if task.spec.kind == "check" else "delegating")
+        # A child waiting on a human's answer is blocked there, not hung in its last tool.
+        live = task.approval or task.current_tool or task.note
+        detail = clean(live) if live else "checking" if task.spec.kind == "check" else "delegating"
+        child = task.latest.child_id if task.latest else None
+        if task.approval and child:
+            # The approval dialog names the child, not the task; this is how to match them.
+            detail += f" · {_short(clean(child)) if short_ids else clean(child)}"
         detail += f" | {task.elapsed_ms / 1_000:.1f}s"
         if task.context_tokens:
             detail += f" | {task.context_tokens:,} ctx tokens"
+        if task.stuck:
+            detail += f" | stuck: {clean(task.stuck)}"
+        if task.wrapping_up:
+            detail += " | wrapping up"
     else:
         detail = run.waiting_reason(task)
     label = state_label(task)
@@ -99,6 +114,8 @@ def attempt_symbol(attempt: Attempt) -> str:
     """One attempt's own outcome, which can differ from its task's current state."""
     if attempt.status == "running":
         return _SYMBOLS["running"]
+    if attempt.failure == "wrapped_up":  # aborted by the host's word, but it concluded
+        return _SYMBOLS["failed"]
     if {attempt.status, attempt.failure} & {"interrupted", "aborted"}:
         return _SYMBOLS["interrupted"]
     return _SYMBOLS["failed"] if attempt.failure else _SYMBOLS["succeeded"]
@@ -113,11 +130,18 @@ def render_panel(
         status_line(run),
     ]
     rows: list[tuple[int, str]] = []
+
+    def row(task: Task, prefix: str = "") -> str:
+        line = prefix + task_line(run, task)
+        if task.approval and wcswidth(clean(line)) > width:
+            line = prefix + task_line(run, task, short_ids=True)
+        return line
+
     for task in run.tasks.values():
-        rows.append((_ORDER[task.state], task_line(run, task)))
+        rows.append((_ORDER[task.state], row(task)))
         # Running items are where the live tool activity is; show them under the group.
         rows.extend(
-            (_ORDER["running"], "↳ " + task_line(run, item))
+            (_ORDER["running"], row(item, "↳ "))
             for item in task.items or []
             if item.state == "running"
         )
@@ -127,8 +151,24 @@ def render_panel(
         lines.append(f"… {len(rows) - max_rows} more rows | /workflow status")
     if run.revisions:
         lines.append(f"Replan: {run.revisions[-1]}")
-    lines.append("/workflow status | /workflow hide | Ctrl+C pauses execution")
+    lines.append("/workflow status | /workflow hide | /workflow pause (Ctrl+C for a typed request)")
     return [truncate(line, width) for line in lines]
+
+
+def scope_lines(attempt: Attempt) -> list[str]:
+    """Writes outside the task's scope: the child's own, then what git saw in the shared tree."""
+    lines = []
+    if own := attempt.own_scope:
+        lines.append(
+            "wrote outside its declared writes (its own edit/write calls): "
+            + ", ".join(clean(path) for path in own)
+        )
+    if seen := attempt.observed_scope:
+        lines.append(
+            "changed outside its declared writes, seen by git (concurrent tasks may share "
+            "blame): " + ", ".join(clean(path) for path in seen)
+        )
+    return lines
 
 
 def attempt_line(task: Task, attempt: Attempt) -> str:
@@ -167,10 +207,7 @@ def render_details(run: Workflow) -> str:
                 lines.append(f"{indent}  data: {clean(compact(attempt.data))[:2_000]}")
             if attempt.error:
                 lines.append(f"{indent}  error: {clean(attempt.error)}")
-            if attempt.scope_violations:
-                lines.append(
-                    f"{indent}  changed outside writes: {clean(', '.join(attempt.scope_violations))}"
-                )
+            lines.extend(f"{indent}  {line}" for line in scope_lines(attempt))
     if run.summary:
         lines.append(f"Conclusion: {clean(run.summary)}")
     return "\n".join(lines)

@@ -390,3 +390,167 @@ and scrollback are in `artifacts/live-workflow-2026-10-14/` (local, not committe
 
 Background execution, worktree isolation, run-level cost budgets and the host-side delegation
 door remain open (ADR-0003, follow-ups). The live check used a single provider and model.
+
+## Host compatibility, capacity waits, the host's record of a child, wrap-ups and pause (2026-11-21)
+
+Scope: [ADR-0004](decisions/0004-following-the-hosts-delegation-policy-and-signals.md). Host
+source checkout at `83714045`, which CI now pins. Environment: macOS arm64, CPython 3.14.5,
+pytest 9.1.1, Ruff 0.16.10, Pyright 1.1.414.
+
+### Automated checks
+
+`pytest -q` against the local host on CPython 3.14: **331 passed** (261 after the
+host-compatibility step, 295 after the host-signal step, 307 after the first review's fixes, 311
+with `/workflow pause`, 323 after the second review's fixes, 329 after the third review's, then
+the final pass's gap). `ruff check`, `ruff format --check` and `pyright` (with the project
+interpreter): clean. The same steps on CPython 3.11 are recorded under the third review pass;
+the GitHub Actions matrix was not re-run for this change.
+
+The host bench now also runs with background jobs on, the host's default: a real `JobService`
+installed through the host's activation seam, its `JobsExtension` registered first and bound to
+the harness, as `cli/entry.py` wires it. With it a child takes and returns a job slot, a full
+`backgroundJobs.limits.agents` produces the host's own refusal sentence, a task waits out a slot
+held outside the run on the same attempt, and a task waits for its sibling to free the only slot,
+spending one admission per child. The jobs-off tests are unchanged, so both admission paths are
+covered.
+
+CPython 3.11, which CI runs, had no project environment in this checkout. The engine-level
+tests in `tests/test_signals.py` (36 cases at the end) were run on CPython 3.11.15 through a
+small runner, with the reviewer's copy of the host contract and a minimal stand-in for pytest:
+all pass. With the N1 fix removed, the pause-during-delay test and one other fail on 3.11 and
+still pass on 3.14. The full CI steps on 3.11 are recorded under the third review pass below.
+
+### Independent review, first pass
+
+A separate reviewer read the change against the host source and reported ten findings, with
+probes for R1, R3, R5/R6 and R9. Each has a regression test; undoing the fix for R1, R7, R9 or
+R10 at runtime makes its test fail. R7's test covered only the wait on a sibling; the second
+pass's N1 added the fallback delay.
+
+| # | Finding | Done |
+| --- | --- | --- |
+| R1 | On a host without `started`, a child that ran and quoted the live-cap sentence was re-run as a capacity wait | Capacity needs proof of no child: `started` false, or a silent envelope when the field is absent |
+| R2 | The agent `timeout_ms` refusal and docs were false on an older host, which still ends a child at its profile's limit | Documented limit, not a code fix: texts now hold for both hosts; this version targets `83714045` and later |
+| R3 | 0.2.0 could not read the new snapshots, which still said schema 2 | Schema 3; schema 2 migrates unchanged; 0.2.0 now reports "Unsupported workflow snapshot version." |
+| R4 | `/workflow wrap` followed `selected` and an unknown task ID fell through to a new goal | It targets the executing run; while a run executes, an unknown or idle ID is answered with the running ones |
+| R5 | Capacity waits used up the automatic retries of ordinary transient failures | Separate counters |
+| R6 | A refused task could wait through another refused task's whole fallback | A refusal wakes its waiters at once |
+| R7 | Ctrl+C while waiting for a slot left a never-started task `interrupted` | Back to `pending`, its unstarted attempt removed (its admission refunded since N7) |
+| R8 | Reported paths reached the model unsanitised, and shared blame covered a child's own writes | Paths cleaned where recorded and printed; own writes reported apart from git's observations |
+| R9 | Backslashes were rewritten to `/`, making a legal POSIX name a false violation | Kept; the host already reports inside paths with `/` |
+| R10 | A halt during a retry delay was noticed only when the delay ended, up to 8 s | Both delays end at once on a halt |
+
+### Independent review, second pass
+
+The reviewer re-ran the first pass's probes: R1 and R3–R10 are fixed, and R2 stays a documented
+limit. Eight new findings concerned the pause, with probes for N1–N7; each now has a regression
+test:
+
+| # | Finding | Done |
+| --- | --- | --- |
+| N1 | On Python 3.11 a pause during the capacity fallback delay left the task `failed[transient]`: the halt ended `asyncio.wait_for` in the same loop pass as the cancel, which it swallowed | A waiter that wakes while a pause stops the members unstarts itself, whatever reached it first |
+| N2 | The host's notice turn (a background job's result waking the model) cleared the pause latch and reset the per-prompt budget | A turn with `source="notice"` keeps both, as the host's own agent budget does |
+| N3 | A blocker halt in the round of a pause lost its reason | `halted` names the pause and the halt |
+| N4 | A task stopped during the git snapshot, before its delegation was asked for, was marked `interrupted` | Back to `pending` under pause and Ctrl+C; a task stopped after its delegation was asked for stays `interrupted`, since the extension cannot know whether its child existed |
+| N5 | A pause that left only slot-waiters, now pending, left the run `needs_attention` | The run's state is recomputed when the pause interrupted nothing |
+| N6 | A check that failed with repair rounds left lost its repair when the execution stopped in that round | The next execution takes up the repair a still-failed check owes |
+| N7 | Unstarting kept the spent admission, and a removed automatic attempt made the next run read `auto` | The admission is refunded, never above the limit; the next run is an ordinary one |
+| N8 | The latch covered only the paused run, so the agent could rebuild the rest as a new run | Every `workflow_run` is refused until the user's next prompt or `/workflow continue`; planning stays allowed |
+
+### Independent review, third pass
+
+N1–N8 were confirmed fixed by re-running the probes (p7 on CPython 3.11.15, three of three). The
+full CI steps were run on CPython 3.11.15 in a CI-shaped copy pinned to `83714045` with
+`uv sync --locked`: on the final tree `ruff check`, `ruff format --check` and `pyright` are clean
+and **331 tests pass**. Three new findings, each with a regression test:
+
+| # | Finding | Done |
+| --- | --- | --- |
+| NEW-1 | The approval dialog asked only about pending checks and approvals are not persisted, so after a restart, `/resume` or `/reload` an owed repair reran its target and the check was then declined with no dialog; the preflight also skipped an owed repair's target | An owed check counts as pending for the dialog and the preflight; its repair is applied only when its command is approved for this run, otherwise no child is spent and its note says the repair waits for approval |
+| NEW-2 | Nothing the model read said a repair was owed, so the next `workflow_run` reran the target and its dependents by surprise | The run report, overview and task detail say the repair is owed, what it reruns, and that retrying, revising or skipping the check cancels it |
+| NEW-3 | Under Ctrl+C the unstart note said "Paused", and a Ctrl+C that left only unstarted tasks left the run `needs_attention` | The note says "Stopped"; the run state is recomputed as after a pause |
+
+Final review pass: NEW-1 to NEW-3 confirmed fixed, and no path found that runs a check command
+unapproved or spends a child before the dialog. One gap was found and closed: a repair's reset
+could rerun, declined and unasked, a check that was neither pending nor owed in a new session;
+the dialog now lists every command a check of the run could still need whenever a check will
+run (test reproducing the reviewer's p12). On the final tree the p12 probe shows one dialog
+listing both commands, and both checks succeeding.
+
+### Live model check, first pass
+
+On 2026-11-21 the real TUI in tmux (130 × 48) ran
+`aelix --agents --trust-extension-path aelix-workflow --approve --permission-mode default` in a
+scratch git repository, with OpenRouter `z-ai/glm-5.3-flash` for parent and children. Model
+spend was about $0.14 as the host reported it; the children's settled spend in the three session
+files is $0.056. This pass ran **before** the review fixes and before `/workflow pause`.
+
+| Exercised | Observed |
+| --- | --- |
+| A plain read-only workflow | 3/3 tasks succeeded |
+| A write task under `default` mode | The child's approval dialog appeared; the panel row read `awaiting approval`; the file changed only after approval; `/workflow status` showed `changed: docs/version.txt` and the child's session ID |
+| Two concurrent writers | One approval dialog at a time; neither change was lost |
+| `/workflow wrap` mid-turn | Answered within a second; the task became `failed[wrapped_up]` with its partial reply kept, and the run was not halted |
+| An agent task with `timeout_ms` | Refused at plan time; the model removed it and went on |
+| Ctrl+C in a run started from a typed prompt | The run paused with the running task `interrupted`; `/workflow continue` resumed it and the run completed |
+| Ctrl+C and Esc in a run started by `/workflow` | Did nothing, three tries; the children ran to completion. This is the host gap in ADR-0004, which `/workflow pause` now covers |
+
+Also observed:
+
+- A model called `workflow_plan` create 16 times in a row without `tasks`, each time told only
+  "tasks must contain between 1 and 64 task objects." (fixed: L2)
+- The model read the session ID in the task detail and called `agent(action="resume")`; the host
+  refused, as the workflow and not the model had delegated it (fixed: L3)
+- After a wrap-up the model guessed a timeout or limit had ended the child (fixed: L4)
+- An approval dialog names the child, not the task, and the panel showed no child ID (fixed: L5)
+- The host's warning that a profile's `timeout_ms` is ignored was drawn over the panel once; the
+  user's profile sets `timeout_ms`.
+
+### Live model check, second pass
+
+Same setup, after the first review's fixes, L2–L5 and `/workflow pause`; about $0.10.
+
+| Exercised | Observed |
+| --- | --- |
+| `/workflow pause` in a turn started by `/workflow` | Answered at once; the running task ended `interrupted` and its child process was gone within 6 s; the pending task stayed pending; the model ended its turn without running the workflow again; `/workflow continue` then completed the run 2/2 |
+| The same from a typed prompt | As above; one Ctrl+C also still paused |
+| `/workflow wrap nosuchtask` mid-run | Listed the running task and started nothing |
+| `/workflow wrap` while idle | Said nothing was executing |
+| Two concurrent writers | The waiting rows showed their child IDs, each dialog matched its row, and both files changed |
+| A wrap-up | Ended `aborted[wrapped_up]` with no resume attempt, but the model still doubted who had asked and retried the task at once (W1: the note now names the user when `/workflow wrap` asked and says not to retry unless the user asks; checked in the third pass) |
+| A plain three-task workflow | Completed 3/3 |
+
+Also seen again: the host's warning that a profile's `timeout_ms` is ignored, drawn over the
+panel at the first child start; two upstream HTTP 500 responses that the host retried.
+
+### Live model check, third pass
+
+On the final tree, with the same setup (real TUI in tmux 130 × 48, OpenRouter
+`z-ai/glm-5.3-flash`, `default` permission mode); about $0.08.
+
+| Exercised | Observed |
+| --- | --- |
+| A plain three-task workflow | Completed 3/3; the two independent tasks started together and the dependent one after both |
+| Ctrl+C in a turn started from a typed prompt | The turn was cancelled; the running task ended `interrupted` and its child process was gone 6 s later; the pending task stayed pending; `/workflow continue` completed the run 2/2 |
+| `/workflow pause` in a turn started by `/workflow <goal>` | Answered at once; the running task ended `interrupted` and its child process was gone; the pending task stayed pending; the model stopped without calling `workflow_run` again, so the refusal after a pause was not exercised; `/workflow continue` completed the run 2/2 |
+| A check with a repair (first seen live in this pass) | The command dialog ("asks to run these 1 verification command(s) when its checks need them … `$ grep -qx 42 out/answer.txt`") appeared before any child process existed. Once allowed, the writer wrote 41 (its write approved through the parent), the check failed with exit 1, the repair reran the writer with the failure context ("repair round 1/2"), it wrote 42, the check passed ("succeeded \| repair 1/2"), and the run completed 2/2. `grep -q` prints nothing, so the repair context ended with an empty output tail |
+| A wrap-up | The note read "wrapped_up: the user asked this task to finish early with /workflow wrap; its reply is partial. Do not retry it unless the user asks: report the partial result."; the model reported the partial result, did not retry or try a resume, and asked the user how to proceed; the other task of the run still ran and succeeded |
+
+Also observed: before one scenario the model called `workflow_plan` create six times in a turn
+without `tasks`; the new error, with its example, did not make it recover, and it then stopped
+and asked the user instead of falling back to the plain agent tool; after `/new` the same prompt
+worked on the first call. The host's warning that a profile's `timeout_ms` is ignored was again
+drawn over the panel at the first child start. No pass showed a traceback, a hang or a lost
+dialog.
+
+Still not covered by any live run: the refusal of `workflow_run` after a pause, a notice turn
+after a pause, an owed repair resumed in a new session, Windows, and a beta.2 host.
+
+### Beta.2
+
+The released beta.2 host is not covered by the suite. Probes only: the contract names this
+extension imports exist in beta.2's `subagent_contract.py`; with beta.2's contract objects the
+classifier handles envelopes without `started`, profile resolution falls back to
+`resolve_profile(allow_project=False)`, a capacity refusal is waited out on the same attempt,
+and a snapshot round-trips; against beta.2's sources the review's R1 probe launches the child
+once and halts.

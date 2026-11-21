@@ -153,23 +153,43 @@ def test_version_1_snapshots_migrate_with_failure_kinds():
     assert run.tasks["a"].attempts[0].failure is None
     assert run.tasks["b"].attempts[0].failure == "declined"
     assert run.tasks["b"].attempts[0].trigger == "run"
-    assert run.to_dict()["schema_version"] == 2
+    assert run.to_dict()["schema_version"] == 3
     assert Workflow.restore(run.to_dict()).to_dict() == run.to_dict()
 
 
-def test_version_1_default_timeouts_defer_to_the_profile():
-    # Version 1 wrote its 120 s default into every task; only other values were choices.
+def test_a_stored_agent_timeout_is_dropped_on_restore():
+    # Version 1 wrote a 120 s limit into every task, and version 2 kept a chosen one. The host
+    # no longer limits a delegated agent's time, so neither may stop a snapshot restoring.
     raw = v1_snapshot()
     raw["tasks"][1]["spec"]["timeout_ms"] = 900_000
     run = Workflow.restore(raw)
     assert run.tasks["a"].spec.timeout_ms is None
-    assert run.tasks["b"].spec.timeout_ms == 900_000
+    assert run.tasks["b"].spec.timeout_ms is None
+    saved = run.to_dict()
+    saved["tasks"][0]["spec"]["timeout_ms"] = 300_000
+    saved["tasks"].append(
+        {
+            "spec": {
+                "id": "c",
+                "title": "c",
+                "kind": "check",
+                "command": ["true"],
+                "timeout_ms": 30_000,
+            },
+            "state": "pending",
+            "attempts": [],
+            "note": "",
+        }
+    )
+    restored = Workflow.restore(saved)
+    assert "timeout_ms" not in restored.tasks["a"].spec.to_dict()
+    assert restored.tasks["c"].spec.timeout_ms == 30_000
 
 
 @pytest.mark.parametrize(
     "mutate, match",
     [
-        (lambda raw: raw.update(schema_version=3), "Unsupported"),
+        (lambda raw: raw.update(schema_version=4), "Unsupported"),
         (lambda raw: raw.update(owner="x"), "Unknown workflow snapshot"),
         (lambda raw: raw["tasks"][0].update(extra=1), "Unknown workflow task"),
         (lambda raw: raw["tasks"][0]["attempts"][0].update(cost=-1), "cost"),
@@ -196,14 +216,68 @@ def test_a_graph_at_the_task_limit_fits_the_attempt_budget():
     assert Workflow.restore(run.to_dict()).state == "completed"
 
 
-def test_an_unset_timeout_defers_to_the_profile():
+def test_only_a_check_takes_a_timeout():
     from aelix_workflow.model import TaskSpec
 
     unset = TaskSpec.parse(spec("a"))
     assert unset.timeout_ms is None
     assert "timeout_ms" not in unset.to_dict()
-    explicit = TaskSpec.parse({**spec("b"), "timeout_ms": 120_000})
+    # Providers often send explicit nulls for optional fields.
+    assert TaskSpec.parse({**spec("a"), "timeout_ms": None}).timeout_ms is None
+    with pytest.raises(WorkflowError, match="no time limit") as refused:
+        TaskSpec.parse({**spec("b"), "timeout_ms": 120_000})
+    assert "Ctrl+C" in str(refused.value) and "Leave timeout_ms out" in str(refused.value)
+    # True on an older Aelix too, which still ends a child at its profile's own limit.
+    assert "profile's own limit (600 s by default), which only the profile can raise" in str(
+        refused.value
+    )
+    check = {"id": "c", "title": "c", "kind": "check", "command": ["true"]}
+    explicit = TaskSpec.parse({**check, "timeout_ms": 120_000})
     assert explicit.timeout_ms == 120_000
     assert TaskSpec.parse(explicit.to_dict()).timeout_ms == 120_000
     with pytest.raises(WorkflowError, match="timeout_ms"):
-        TaskSpec.parse({**spec("c"), "timeout_ms": 500})
+        TaskSpec.parse({**check, "timeout_ms": 500})
+
+
+def test_a_new_or_revised_agent_task_with_a_timeout_is_refused():
+    with pytest.raises(WorkflowError, match="no time limit"):
+        Workflow.create("Review", [{**spec("a"), "timeout_ms": 60_000}])
+    run = Workflow.create("Review", [spec("a")])
+    before = copy.deepcopy(run.to_dict())
+    for replace in (True, False):
+        task = spec("a" if replace else "b")
+        with pytest.raises(WorkflowError, match="no time limit"):
+            run.amend([{**task, "timeout_ms": 60_000}], replace=replace, reason="slower")
+    assert run.to_dict() == before
+
+
+def test_a_version_2_snapshot_from_before_the_host_record_restores_unchanged():
+    # As 0.2.0 wrote it: schema 2, attempts without the host-reported fields.
+    raw = {**Workflow.restore(v1_snapshot()).to_dict(), "schema_version": 2}
+    attempt = raw["tasks"][0]["attempts"][0]
+    assert not {"session_id", "changed_files", "reason", "own_violations"} & set(attempt)
+    # Version 3 only adds, so version 2 reads as itself, labelled 3; 0.2.0 refuses 3.
+    assert Workflow.restore(raw).to_dict() == {**raw, "schema_version": 3}
+    run = Workflow.restore(raw)
+    run.tasks["a"].attempts[0].session_id = "child-1"
+    run.tasks["a"].attempts[0].changed_files = ["src/a.py"]
+    saved = run.to_dict()["tasks"][0]["attempts"][0]
+    assert (saved["session_id"], saved["changed_files"]) == ("child-1", ["src/a.py"])
+    assert "unconfirmed_files" not in saved
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("changed_files", ["a.py"] * 65),
+        ("changed_files", "a.py"),
+        ("files_overflow", -1),
+        ("session_id", 7),
+        ("reason", "x" * 501),
+    ],
+)
+def test_host_reported_attempt_fields_are_bounded_on_restore(field, value):
+    raw = Workflow.restore(v1_snapshot()).to_dict()
+    raw["tasks"][0]["attempts"][0][field] = value
+    with pytest.raises(WorkflowError):
+        Workflow.restore(raw)
